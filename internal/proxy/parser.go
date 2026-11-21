@@ -385,11 +385,17 @@ func parseOpenAIChatSSE(body []byte, out *ParsedExchange) {
 
 func parseOpenAIResponsesRequest(body []byte, out *ParsedExchange) {
 	var req struct {
-		Model        string           `json:"model"`
-		Stream       bool             `json:"stream"`
-		Instructions string           `json:"instructions"`
-		Tools        []map[string]any `json:"tools"`
-		Input        json.RawMessage  `json:"input"`
+		Model              string `json:"model"`
+		Stream             bool   `json:"stream"`
+		Instructions       string `json:"instructions"`
+		PromptCacheKey     string `json:"prompt_cache_key"`
+		PreviousResponseID string `json:"previous_response_id"`
+		Reasoning          *struct {
+			Effort  string `json:"effort"`
+			Summary string `json:"summary"`
+		} `json:"reasoning"`
+		Tools []map[string]any `json:"tools"`
+		Input json.RawMessage  `json:"input"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return
@@ -403,11 +409,21 @@ func parseOpenAIResponsesRequest(body []byte, out *ParsedExchange) {
 	if req.Stream {
 		out.IsStream = true
 	}
-	if len(req.Tools) > 0 {
-		out.ToolDefinitions = req.Tools
+	if req.Reasoning != nil && req.Reasoning.Effort != "" {
+		setExchangeMeta(out, "reasoning_effort", req.Reasoning.Effort)
 	}
+	if req.PromptCacheKey != "" {
+		setExchangeMeta(out, "prompt_cache_key", req.PromptCacheKey)
+	}
+	if req.PreviousResponseID != "" {
+		setExchangeMeta(out, "previous_response_id", req.PreviousResponseID)
+	}
+	if len(req.Tools) > 0 {
+		out.ToolDefinitions = normalizeToolDefinitions(req.Tools)
+	}
+	var sysParts []string
 	if req.Instructions != "" {
-		out.SystemPrompt = req.Instructions
+		sysParts = append(sysParts, req.Instructions)
 		out.RequestMessages = append(out.RequestMessages, ParsedMessage{
 			Role:    "system",
 			Content: req.Instructions,
@@ -419,32 +435,75 @@ func parseOpenAIResponsesRequest(body []byte, out *ParsedExchange) {
 			Role:    "user",
 			Content: strInput,
 		})
+		if len(sysParts) > 0 {
+			out.SystemPrompt = strings.Join(sysParts, "\n\n")
+		}
 		return
 	}
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(req.Input, &items); err != nil {
+		if len(sysParts) > 0 {
+			out.SystemPrompt = strings.Join(sysParts, "\n\n")
+		}
 		return
 	}
+
+	var pendingAssistant *ParsedMessage
+	flushAssistant := func() {
+		if pendingAssistant != nil {
+			out.RequestMessages = append(out.RequestMessages, *pendingAssistant)
+			pendingAssistant = nil
+		}
+	}
+	ensureAssistant := func() *ParsedMessage {
+		if pendingAssistant == nil {
+			pendingAssistant = &ParsedMessage{Role: "assistant"}
+		}
+		return pendingAssistant
+	}
+
 	for _, item := range items {
 		var itemType, role string
 		_ = json.Unmarshal(item["type"], &itemType)
 		_ = json.Unmarshal(item["role"], &role)
 		switch itemType {
+		case "reasoning":
+			rText := extractTextFromRaw(item["summary"])
+			if rText == "" {
+				rText = extractTextFromRaw(item["content"])
+			}
+			if rText != "" {
+				pa := ensureAssistant()
+				if pa.Reasoning == "" {
+					pa.Reasoning = rText
+				} else {
+					pa.Reasoning += "\n" + rText
+				}
+			}
 		case "function_call":
-			var callID, name, args string
+			var callID, itemID, name string
 			_ = json.Unmarshal(item["call_id"], &callID)
+			_ = json.Unmarshal(item["id"], &itemID)
 			_ = json.Unmarshal(item["name"], &name)
-			_ = json.Unmarshal(item["arguments"], &args)
-			out.RequestMessages = append(out.RequestMessages, ParsedMessage{
-				Role: "assistant",
-				ToolCalls: []ParsedToolCall{
-					{ID: callID, Name: name, Arguments: args},
-				},
+			if callID == "" {
+				callID = itemID
+			}
+			args := extractRawStringOrJSON(item["arguments"])
+			pa := ensureAssistant()
+			pa.ToolCalls = append(pa.ToolCalls, ParsedToolCall{
+				ID:        callID,
+				Name:      name,
+				Arguments: args,
 			})
 		case "function_call_output":
-			var callID string
+			flushAssistant()
+			var callID, itemID string
 			_ = json.Unmarshal(item["call_id"], &callID)
-			output := extractTextFromRaw(item["output"])
+			_ = json.Unmarshal(item["id"], &itemID)
+			if callID == "" {
+				callID = itemID
+			}
+			output := extractOutputFromRaw(item["output"])
 			out.RequestMessages = append(out.RequestMessages, ParsedMessage{
 				Role: "tool",
 				ToolResults: []ParsedToolResult{
@@ -454,9 +513,21 @@ func parseOpenAIResponsesRequest(body []byte, out *ParsedExchange) {
 		default:
 			if role != "" {
 				text := extractTextFromRaw(item["content"])
+				if role == "assistant" {
+					pa := ensureAssistant()
+					if text != "" {
+						if pa.Content == "" {
+							pa.Content = text
+						} else {
+							pa.Content += "\n" + text
+						}
+					}
+					continue
+				}
+				flushAssistant()
 				if role == "developer" || role == "system" {
-					if out.SystemPrompt == "" {
-						out.SystemPrompt = text
+					if text != "" {
+						sysParts = append(sysParts, text)
 					}
 					role = "system"
 				}
@@ -467,6 +538,10 @@ func parseOpenAIResponsesRequest(body []byte, out *ParsedExchange) {
 			}
 		}
 	}
+	flushAssistant()
+	if len(sysParts) > 0 {
+		out.SystemPrompt = strings.Join(sysParts, "\n\n")
+	}
 }
 
 func parseOpenAIResponsesJSON(body []byte, out *ParsedExchange) {
@@ -475,10 +550,11 @@ func parseOpenAIResponsesJSON(body []byte, out *ParsedExchange) {
 		Model  string `json:"model"`
 		Status string `json:"status"`
 		Output []struct {
+			ID        string          `json:"id"`
 			Type      string          `json:"type"`
 			CallID    string          `json:"call_id"`
 			Name      string          `json:"name"`
-			Arguments string          `json:"arguments"`
+			Arguments json.RawMessage `json:"arguments"`
 			Content   json.RawMessage `json:"content"`
 			Summary   json.RawMessage `json:"summary"`
 		} `json:"output"`
@@ -488,6 +564,9 @@ func parseOpenAIResponsesJSON(body []byte, out *ParsedExchange) {
 			InputTokensDetails struct {
 				CachedTokens int `json:"cached_tokens"`
 			} `json:"input_tokens_details"`
+			OutputTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"output_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -500,8 +579,11 @@ func parseOpenAIResponsesJSON(body []byte, out *ParsedExchange) {
 		out.ResponseModel = resp.Model
 		out.Model = resp.Model
 	}
-	out.FinishReason = resp.Status
+	if resp.Status != "" {
+		out.FinishReason = resp.Status
+	}
 	var textParts, reasonParts []string
+	var toolCalls []ParsedToolCall
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "message":
@@ -509,52 +591,126 @@ func parseOpenAIResponsesJSON(body []byte, out *ParsedExchange) {
 				textParts = append(textParts, t)
 			}
 		case "reasoning":
-			if t := extractTextFromRaw(item.Summary); t != "" {
+			t := extractTextFromRaw(item.Summary)
+			if t == "" {
+				t = extractTextFromRaw(item.Content)
+			}
+			if t != "" {
 				reasonParts = append(reasonParts, t)
 			}
 		case "function_call":
-			out.ToolCalls = append(out.ToolCalls, ParsedToolCall{
-				ID:        item.CallID,
+			callID := item.CallID
+			if callID == "" {
+				callID = item.ID
+			}
+			toolCalls = append(toolCalls, ParsedToolCall{
+				ID:        callID,
 				Name:      item.Name,
-				Arguments: item.Arguments,
+				Arguments: extractRawStringOrJSON(item.Arguments),
 			})
 		}
 	}
-	out.AssistantText = strings.Join(textParts, "\n")
-	out.ReasoningContent = strings.Join(reasonParts, "\n")
-	out.PromptTokens = resp.Usage.InputTokens
-	out.CompletionTokens = resp.Usage.OutputTokens
-	out.CachedTokens = resp.Usage.InputTokensDetails.CachedTokens
+	if len(textParts) > 0 {
+		out.AssistantText = strings.Join(textParts, "\n")
+	}
+	if len(reasonParts) > 0 {
+		out.ReasoningContent = strings.Join(reasonParts, "\n")
+	}
+	if len(toolCalls) > 0 {
+		out.ToolCalls = toolCalls
+	}
+	if resp.Usage.InputTokens > 0 {
+		out.PromptTokens = resp.Usage.InputTokens
+	}
+	if resp.Usage.OutputTokens > 0 {
+		out.CompletionTokens = resp.Usage.OutputTokens
+	}
+	if resp.Usage.InputTokensDetails.CachedTokens > 0 {
+		out.CachedTokens = resp.Usage.InputTokensDetails.CachedTokens
+	}
+	if resp.Usage.OutputTokensDetails.ReasoningTokens > 0 {
+		out.ReasoningTokens = resp.Usage.OutputTokensDetails.ReasoningTokens
+	}
+}
+
+type responsesFCAcc struct {
+	index        int
+	itemID       string
+	callID       string
+	name         string
+	argsBuf      strings.Builder
+	finalArgs    string
+	hasFinalArgs bool
 }
 
 func parseOpenAIResponsesSSE(body []byte, out *ParsedExchange) {
 	var textBuf strings.Builder
 	var reasonBuf strings.Builder
-	scanner := bufio.NewScanner(bytes.NewReader(body))
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	var doneTextParts []string
+	var doneReasonParts []string
+	fcByIndex := map[int]*responsesFCAcc{}
+	fcByItemID := map[string]*responsesFCAcc{}
+
+	getOrCreateFC := func(idx int, itemID string) *responsesFCAcc {
+		if itemID != "" {
+			if acc, ok := fcByItemID[itemID]; ok {
+				return acc
+			}
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if acc, ok := fcByIndex[idx]; ok {
+			if itemID != "" && acc.itemID == "" {
+				acc.itemID = itemID
+				fcByItemID[itemID] = acc
+			}
+			return acc
+		}
+		acc := &responsesFCAcc{index: idx, itemID: itemID}
+		fcByIndex[idx] = acc
+		if itemID != "" {
+			fcByItemID[itemID] = acc
+		}
+		return acc
+	}
+
+	events := ParseSSEEvents(body)
+	for _, ev := range events {
+		payload := strings.TrimSpace(ev.Data)
 		if payload == "" || payload == "[DONE]" {
 			continue
 		}
 		var evt struct {
-			Type     string          `json:"type"`
-			Delta    string          `json:"delta"`
-			Response json.RawMessage `json:"response"`
+			Type        string          `json:"type"`
+			Delta       string          `json:"delta"`
+			Text        string          `json:"text"`
+			Arguments   string          `json:"arguments"`
+			Name        string          `json:"name"`
+			ItemID      string          `json:"item_id"`
+			OutputIndex int             `json:"output_index"`
+			Response    json.RawMessage `json:"response"`
+			Item        *struct {
+				ID        string          `json:"id"`
+				Type      string          `json:"type"`
+				CallID    string          `json:"call_id"`
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+				Content   json.RawMessage `json:"content"`
+				Summary   json.RawMessage `json:"summary"`
+			} `json:"item"`
 		}
 		if err := json.Unmarshal([]byte(payload), &evt); err != nil {
 			continue
 		}
-		switch evt.Type {
+		evType := evt.Type
+		if evType == "" {
+			evType = ev.Event
+		}
+		switch evType {
 		case "response.created", "response.in_progress":
 			if len(evt.Response) > 0 {
 				var meta struct {
-					ID    string `json:"id"`
-					Model string `json:"model"`
+					ID     string `json:"id"`
+					Model  string `json:"model"`
+					Status string `json:"status"`
 				}
 				if err := json.Unmarshal(evt.Response, &meta); err == nil {
 					if meta.ID != "" && out.ResponseID == "" {
@@ -564,23 +720,120 @@ func parseOpenAIResponsesSSE(body []byte, out *ParsedExchange) {
 						out.ResponseModel = meta.Model
 						out.Model = meta.Model
 					}
+					if meta.Status != "" && out.FinishReason == "" {
+						out.FinishReason = meta.Status
+					}
+				}
+			}
+		case "response.output_item.added":
+			if evt.Item != nil && evt.Item.Type == "function_call" {
+				acc := getOrCreateFC(evt.OutputIndex, evt.Item.ID)
+				if evt.Item.CallID != "" {
+					acc.callID = evt.Item.CallID
+				}
+				if evt.Item.Name != "" {
+					acc.name = evt.Item.Name
+				}
+				if args := extractRawStringOrJSON(evt.Item.Arguments); args != "" {
+					acc.argsBuf.WriteString(args)
 				}
 			}
 		case "response.output_text.delta":
 			textBuf.WriteString(evt.Delta)
-		case "response.reasoning_summary_text.delta":
+		case "response.output_text.done":
+			if evt.Text != "" {
+				doneTextParts = append(doneTextParts, evt.Text)
+			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 			reasonBuf.WriteString(evt.Delta)
+		case "response.reasoning_summary_text.done", "response.reasoning_text.done":
+			if evt.Text != "" {
+				doneReasonParts = append(doneReasonParts, evt.Text)
+			}
+		case "response.function_call_arguments.delta":
+			acc := getOrCreateFC(evt.OutputIndex, evt.ItemID)
+			acc.argsBuf.WriteString(evt.Delta)
+		case "response.function_call_arguments.done":
+			acc := getOrCreateFC(evt.OutputIndex, evt.ItemID)
+			if evt.Name != "" {
+				acc.name = evt.Name
+			}
+			acc.finalArgs = evt.Arguments
+			acc.hasFinalArgs = true
+		case "response.output_item.done":
+			if evt.Item != nil {
+				switch evt.Item.Type {
+				case "function_call":
+					acc := getOrCreateFC(evt.OutputIndex, evt.Item.ID)
+					if evt.Item.CallID != "" {
+						acc.callID = evt.Item.CallID
+					}
+					if evt.Item.Name != "" {
+						acc.name = evt.Item.Name
+					}
+					if args := extractRawStringOrJSON(evt.Item.Arguments); args != "" {
+						acc.finalArgs = args
+						acc.hasFinalArgs = true
+					}
+				case "message":
+					if t := extractTextFromRaw(evt.Item.Content); t != "" {
+						doneTextParts = append(doneTextParts, t)
+					}
+				case "reasoning":
+					t := extractTextFromRaw(evt.Item.Summary)
+					if t == "" {
+						t = extractTextFromRaw(evt.Item.Content)
+					}
+					if t != "" {
+						doneReasonParts = append(doneReasonParts, t)
+					}
+				}
+			}
 		case "response.completed", "response.incomplete", "response.failed":
 			if len(evt.Response) > 0 {
 				parseOpenAIResponsesJSON(evt.Response, out)
 			}
+			if out.FinishReason == "" {
+				out.FinishReason = strings.TrimPrefix(evType, "response.")
+			}
 		}
 	}
 	if out.AssistantText == "" {
-		out.AssistantText = textBuf.String()
+		if textBuf.Len() > 0 {
+			out.AssistantText = textBuf.String()
+		} else if len(doneTextParts) > 0 {
+			out.AssistantText = strings.Join(doneTextParts, "\n")
+		}
 	}
 	if out.ReasoningContent == "" {
-		out.ReasoningContent = reasonBuf.String()
+		if reasonBuf.Len() > 0 {
+			out.ReasoningContent = reasonBuf.String()
+		} else if len(doneReasonParts) > 0 {
+			out.ReasoningContent = strings.Join(doneReasonParts, "\n")
+		}
+	}
+	if len(out.ToolCalls) == 0 && len(fcByIndex) > 0 {
+		indices := make([]int, 0, len(fcByIndex))
+		for idx := range fcByIndex {
+			indices = append(indices, idx)
+		}
+		sort.Ints(indices)
+		for _, idx := range indices {
+			acc := fcByIndex[idx]
+			callID := acc.callID
+			if callID == "" {
+				callID = acc.itemID
+			}
+			args := acc.argsBuf.String()
+			if acc.hasFinalArgs {
+				args = acc.finalArgs
+			}
+			out.ToolCalls = append(out.ToolCalls, ParsedToolCall{
+				ID:        callID,
+				Name:      acc.name,
+				Arguments: args,
+			})
+		}
 	}
 }
 
@@ -897,7 +1150,7 @@ func ExtractToolsFromRequest(headers http.Header, body []byte) []map[string]any 
 	if err := json.Unmarshal(plain, &req); err != nil {
 		return nil
 	}
-	return req.Tools
+	return normalizeToolDefinitions(req.Tools)
 }
 
 func ExtractRequestModel(headers http.Header, body []byte) string {
@@ -1024,9 +1277,11 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 		return nil
 	}
 
-	var id, model, object, role, finishReason string
+	var id, model, object, role, status, finishReason string
 	var contentBuf strings.Builder
 	var reasoningBuf strings.Builder
+	var doneContentParts []string
+	var doneReasonParts []string
 	var usage map[string]any
 	var hasValidJSON bool
 
@@ -1040,6 +1295,30 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 	anthropicBlocks := map[int]*tcAcc{}
 	anthropicUsage := map[string]any{}
 	var responsesToolCalls []map[string]any
+	var responsesOutput []any
+	respFCByIndex := map[int]*responsesFCAcc{}
+	respFCByItemID := map[string]*responsesFCAcc{}
+
+	getOrCreateRespFC := func(idx int, itemID string) *responsesFCAcc {
+		if itemID != "" {
+			if acc, ok := respFCByItemID[itemID]; ok {
+				return acc
+			}
+		}
+		if acc, ok := respFCByIndex[idx]; ok {
+			if itemID != "" && acc.itemID == "" {
+				acc.itemID = itemID
+				respFCByItemID[itemID] = acc
+			}
+			return acc
+		}
+		acc := &responsesFCAcc{index: idx, itemID: itemID}
+		respFCByIndex[idx] = acc
+		if itemID != "" {
+			respFCByItemID[itemID] = acc
+		}
+		return acc
+	}
 
 	for _, ev := range events {
 		payload := strings.TrimSpace(ev.Data)
@@ -1223,22 +1502,40 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 			continue
 		}
 
-		if strings.HasPrefix(evType, "response.") {
+		if strings.HasPrefix(evType, "response.") || strings.HasPrefix(ev.Event, "response.") {
 			if object == "" {
 				object = "response"
 			}
+			if evType == "" {
+				evType = ev.Event
+			}
 			var rEvt struct {
-				Type     string          `json:"type"`
-				Delta    string          `json:"delta"`
-				Response json.RawMessage `json:"response"`
+				Type        string          `json:"type"`
+				Delta       string          `json:"delta"`
+				Text        string          `json:"text"`
+				Arguments   string          `json:"arguments"`
+				Name        string          `json:"name"`
+				ItemID      string          `json:"item_id"`
+				OutputIndex int             `json:"output_index"`
+				Response    json.RawMessage `json:"response"`
+				Item        *struct {
+					ID        string          `json:"id"`
+					Type      string          `json:"type"`
+					CallID    string          `json:"call_id"`
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+					Content   json.RawMessage `json:"content"`
+					Summary   json.RawMessage `json:"summary"`
+				} `json:"item"`
 			}
 			if err := json.Unmarshal([]byte(payload), &rEvt); err == nil {
-				switch rEvt.Type {
+				switch evType {
 				case "response.created", "response.in_progress":
 					if len(rEvt.Response) > 0 {
 						var meta struct {
-							ID    string `json:"id"`
-							Model string `json:"model"`
+							ID     string `json:"id"`
+							Model  string `json:"model"`
+							Status string `json:"status"`
 						}
 						if err := json.Unmarshal(rEvt.Response, &meta); err == nil {
 							if meta.ID != "" && id == "" {
@@ -1247,12 +1544,75 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 							if meta.Model != "" {
 								model = meta.Model
 							}
+							if meta.Status != "" && status == "" {
+								status = meta.Status
+							}
+						}
+					}
+				case "response.output_item.added":
+					if rEvt.Item != nil && rEvt.Item.Type == "function_call" {
+						acc := getOrCreateRespFC(rEvt.OutputIndex, rEvt.Item.ID)
+						if rEvt.Item.CallID != "" {
+							acc.callID = rEvt.Item.CallID
+						}
+						if rEvt.Item.Name != "" {
+							acc.name = rEvt.Item.Name
+						}
+						if args := extractRawStringOrJSON(rEvt.Item.Arguments); args != "" {
+							acc.argsBuf.WriteString(args)
 						}
 					}
 				case "response.output_text.delta":
 					contentBuf.WriteString(rEvt.Delta)
-				case "response.reasoning_summary_text.delta":
+				case "response.output_text.done":
+					if rEvt.Text != "" {
+						doneContentParts = append(doneContentParts, rEvt.Text)
+					}
+				case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 					reasoningBuf.WriteString(rEvt.Delta)
+				case "response.reasoning_summary_text.done", "response.reasoning_text.done":
+					if rEvt.Text != "" {
+						doneReasonParts = append(doneReasonParts, rEvt.Text)
+					}
+				case "response.function_call_arguments.delta":
+					acc := getOrCreateRespFC(rEvt.OutputIndex, rEvt.ItemID)
+					acc.argsBuf.WriteString(rEvt.Delta)
+				case "response.function_call_arguments.done":
+					acc := getOrCreateRespFC(rEvt.OutputIndex, rEvt.ItemID)
+					if rEvt.Name != "" {
+						acc.name = rEvt.Name
+					}
+					acc.finalArgs = rEvt.Arguments
+					acc.hasFinalArgs = true
+				case "response.output_item.done":
+					if rEvt.Item != nil {
+						switch rEvt.Item.Type {
+						case "function_call":
+							acc := getOrCreateRespFC(rEvt.OutputIndex, rEvt.Item.ID)
+							if rEvt.Item.CallID != "" {
+								acc.callID = rEvt.Item.CallID
+							}
+							if rEvt.Item.Name != "" {
+								acc.name = rEvt.Item.Name
+							}
+							if args := extractRawStringOrJSON(rEvt.Item.Arguments); args != "" {
+								acc.finalArgs = args
+								acc.hasFinalArgs = true
+							}
+						case "message":
+							if t := extractTextFromRaw(rEvt.Item.Content); t != "" {
+								doneContentParts = append(doneContentParts, t)
+							}
+						case "reasoning":
+							t := extractTextFromRaw(rEvt.Item.Summary)
+							if t == "" {
+								t = extractTextFromRaw(rEvt.Item.Content)
+							}
+							if t != "" {
+								doneReasonParts = append(doneReasonParts, t)
+							}
+						}
+					}
 				case "response.completed", "response.incomplete", "response.failed":
 					if len(rEvt.Response) > 0 {
 						var respObj struct {
@@ -1261,13 +1621,20 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 							Status string         `json:"status"`
 							Usage  map[string]any `json:"usage"`
 							Output []struct {
+								ID        string          `json:"id"`
 								Type      string          `json:"type"`
 								CallID    string          `json:"call_id"`
 								Name      string          `json:"name"`
-								Arguments string          `json:"arguments"`
+								Arguments json.RawMessage `json:"arguments"`
 								Content   json.RawMessage `json:"content"`
 								Summary   json.RawMessage `json:"summary"`
 							} `json:"output"`
+						}
+						var rawRespMap map[string]any
+						if err := json.Unmarshal(rEvt.Response, &rawRespMap); err == nil {
+							if outArr, ok := rawRespMap["output"].([]any); ok && len(outArr) > 0 {
+								responsesOutput = outArr
+							}
 						}
 						if err := json.Unmarshal(rEvt.Response, &respObj); err == nil {
 							if respObj.ID != "" {
@@ -1277,12 +1644,14 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 								model = respObj.Model
 							}
 							if respObj.Status != "" {
+								status = respObj.Status
 								finishReason = respObj.Status
 							}
 							if len(respObj.Usage) > 0 {
 								usage = respObj.Usage
 							}
 							var txtParts, rsnParts []string
+							var completedTCs []map[string]any
 							for _, item := range respObj.Output {
 								switch item.Type {
 								case "message":
@@ -1290,19 +1659,30 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 										txtParts = append(txtParts, t)
 									}
 								case "reasoning":
-									if t := extractTextFromRaw(item.Summary); t != "" {
+									t := extractTextFromRaw(item.Summary)
+									if t == "" {
+										t = extractTextFromRaw(item.Content)
+									}
+									if t != "" {
 										rsnParts = append(rsnParts, t)
 									}
 								case "function_call":
-									responsesToolCalls = append(responsesToolCalls, map[string]any{
-										"id":   item.CallID,
+									callID := item.CallID
+									if callID == "" {
+										callID = item.ID
+									}
+									completedTCs = append(completedTCs, map[string]any{
+										"id":   callID,
 										"type": "function",
 										"function": map[string]any{
 											"name":      item.Name,
-											"arguments": item.Arguments,
+											"arguments": extractRawStringOrJSON(item.Arguments),
 										},
 									})
 								}
+							}
+							if len(completedTCs) > 0 {
+								responsesToolCalls = completedTCs
 							}
 							if contentBuf.Len() == 0 && len(txtParts) > 0 {
 								contentBuf.WriteString(strings.Join(txtParts, "\n"))
@@ -1311,6 +1691,12 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 								reasoningBuf.WriteString(strings.Join(rsnParts, "\n"))
 							}
 						}
+					}
+					if status == "" {
+						status = strings.TrimPrefix(evType, "response.")
+					}
+					if finishReason == "" {
+						finishReason = status
 					}
 				}
 			}
@@ -1326,6 +1712,12 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 	}
 	if usage == nil && len(anthropicUsage) > 0 {
 		usage = anthropicUsage
+	}
+	if contentBuf.Len() == 0 && len(doneContentParts) > 0 {
+		contentBuf.WriteString(strings.Join(doneContentParts, "\n"))
+	}
+	if reasoningBuf.Len() == 0 && len(doneReasonParts) > 0 {
+		reasoningBuf.WriteString(strings.Join(doneReasonParts, "\n"))
 	}
 
 	toolCalls := make([]map[string]any, 0)
@@ -1371,6 +1763,31 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 	}
 	if len(responsesToolCalls) > 0 {
 		toolCalls = append(toolCalls, responsesToolCalls...)
+	} else if len(respFCByIndex) > 0 {
+		indices := make([]int, 0, len(respFCByIndex))
+		for idx := range respFCByIndex {
+			indices = append(indices, idx)
+		}
+		sort.Ints(indices)
+		for _, idx := range indices {
+			acc := respFCByIndex[idx]
+			callID := acc.callID
+			if callID == "" {
+				callID = acc.itemID
+			}
+			args := acc.argsBuf.String()
+			if acc.hasFinalArgs {
+				args = acc.finalArgs
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   callID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      acc.name,
+					"arguments": args,
+				},
+			})
+		}
 	}
 
 	merged := map[string]any{
@@ -1379,6 +1796,47 @@ func BuildMergedSSEResponse(rawBody []byte, headers map[string][]string) map[str
 		"object":  object,
 		"role":    role,
 		"content": contentBuf.String(),
+	}
+	if object == "response" {
+		if status != "" {
+			merged["status"] = status
+		} else if finishReason != "" {
+			merged["status"] = finishReason
+		}
+		if len(responsesOutput) > 0 {
+			merged["output"] = responsesOutput
+		} else {
+			synthOutput := make([]any, 0)
+			if reasoningBuf.Len() > 0 {
+				synthOutput = append(synthOutput, map[string]any{
+					"type": "reasoning",
+					"summary": []map[string]any{
+						{"type": "summary_text", "text": reasoningBuf.String()},
+					},
+				})
+			}
+			if contentBuf.Len() > 0 {
+				synthOutput = append(synthOutput, map[string]any{
+					"type": "message",
+					"role": "assistant",
+					"content": []map[string]any{
+						{"type": "output_text", "text": contentBuf.String()},
+					},
+				})
+			}
+			for _, tc := range toolCalls {
+				fn, _ := tc["function"].(map[string]any)
+				synthOutput = append(synthOutput, map[string]any{
+					"type":      "function_call",
+					"call_id":   tc["id"],
+					"name":      fn["name"],
+					"arguments": fn["arguments"],
+				})
+			}
+			if len(synthOutput) > 0 {
+				merged["output"] = synthOutput
+			}
+		}
 	}
 	if reasoningBuf.Len() > 0 {
 		merged["reasoning_content"] = reasoningBuf.String()
@@ -1400,6 +1858,76 @@ func strField(m map[string]any, key string) string {
 	return v
 }
 
+func setExchangeMeta(out *ParsedExchange, key string, val any) {
+	if out.Metadata == nil {
+		out.Metadata = map[string]any{}
+	}
+	out.Metadata[key] = val
+}
+
+func normalizeToolDefinitions(tools []map[string]any) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		if t == nil {
+			continue
+		}
+		norm := make(map[string]any, len(t)+1)
+		for k, v := range t {
+			norm[k] = v
+		}
+		tType, _ := norm["type"].(string)
+		if tType != "" && tType != "function" {
+			if name, _ := norm["name"].(string); name == "" {
+				norm["name"] = tType
+			}
+		}
+		out = append(out, norm)
+	}
+	return out
+}
+
+func extractRawStringOrJSON(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		return s
+	}
+	return string(trimmed)
+}
+
+func extractOutputFromRaw(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		return s
+	}
+	var arr []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(trimmed, &arr); err == nil && len(arr) > 0 {
+		var parts []string
+		for _, item := range arr {
+			if item.Text != "" {
+				parts = append(parts, item.Text)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+	return string(trimmed)
+}
+
 func extractTextFromRaw(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -1414,12 +1942,21 @@ func extractTextFromRaw(raw json.RawMessage) string {
 	}
 	if err := json.Unmarshal(raw, &arr); err == nil {
 		var parts []string
+		hasImage := false
 		for _, item := range arr {
 			if item.Text != "" {
 				parts = append(parts, item.Text)
+			} else if item.Type == "input_image" || item.Type == "image_url" || item.Type == "image" {
+				hasImage = true
 			}
 		}
-		return strings.Join(parts, "\n")
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+		if hasImage {
+			return "[image]"
+		}
+		return ""
 	}
 	return ""
 }

@@ -144,6 +144,21 @@ func (s *Server) handleLogout(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+type traceSummaryResponse struct {
+	storage.SessionSummary
+	UpstreamURL string `json:"upstream_url"`
+}
+
+func (s *Server) upstreamURL(name string) string {
+	if s.cfg == nil || name == "" {
+		return ""
+	}
+	if u, ok := s.cfg.Upstreams[name]; ok {
+		return u.URL
+	}
+	return ""
+}
+
 func (s *Server) handleListTraces(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
@@ -160,8 +175,15 @@ func (s *Server) handleListTraces(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	items := make([]traceSummaryResponse, 0, len(traces))
+	for _, tr := range traces {
+		items = append(items, traceSummaryResponse{
+			SessionSummary: tr,
+			UpstreamURL:    s.upstreamURL(tr.Upstream),
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"traces": traces,
+		"traces": items,
 		"total":  total,
 	})
 }
@@ -224,6 +246,7 @@ func (s *Server) handleGetTraceTrajectories(w http.ResponseWriter, r *http.Reque
 	trajs := atif.BuildTrajectories(sess, reqs)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"session_id":     sessionID,
+		"upstream_url":   s.upstreamURL(sess.Upstream),
 		"llm_call_count": len(reqs),
 		"trajectories":   trajs,
 	})

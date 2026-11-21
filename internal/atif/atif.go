@@ -121,6 +121,7 @@ func BuildTrajectories(sess *storage.SessionSummary, reqs []storage.RequestRecor
 
 	mainRecs := make([]parsedRecord, 0, len(ordered))
 	subGroups := make([][]parsedRecord, 0)
+	subGroupByID := make(map[string]int)
 	var currentSub []parsedRecord
 	var prevSubRec *parsedRecord
 	sawMainSinceSub := false
@@ -204,15 +205,25 @@ func BuildTrajectories(sess *storage.SessionSummary, reqs []storage.RequestRecor
 
 		pr := parsedRecord{rec: rec, parsed: parsed, meta: entry}
 		if isSubagentMetadata(parsed.Metadata) {
-			if len(currentSub) > 0 && (sawMainSinceSub || (prevSubRec != nil && shouldStartNewSegment(*prevSubRec, pr))) {
-				subGroups = append(subGroups, currentSub)
-				currentSub = nil
-				prevSubRec = nil
+			if subKey, _ := parsed.Metadata["subagent_id"].(string); strings.TrimSpace(subKey) != "" {
+				subKey = strings.TrimSpace(subKey)
+				if idx, ok := subGroupByID[subKey]; ok {
+					subGroups[idx] = append(subGroups[idx], pr)
+				} else {
+					subGroupByID[subKey] = len(subGroups)
+					subGroups = append(subGroups, []parsedRecord{pr})
+				}
+			} else {
+				if len(currentSub) > 0 && (sawMainSinceSub || (prevSubRec != nil && shouldStartNewSegment(*prevSubRec, pr))) {
+					subGroups = append(subGroups, currentSub)
+					currentSub = nil
+					prevSubRec = nil
+				}
+				currentSub = append(currentSub, pr)
+				last := pr
+				prevSubRec = &last
+				sawMainSinceSub = false
 			}
-			currentSub = append(currentSub, pr)
-			last := pr
-			prevSubRec = &last
-			sawMainSinceSub = false
 		} else {
 			mainRecs = append(mainRecs, pr)
 			if len(currentSub) > 0 {
@@ -396,6 +407,7 @@ func BuildTrajectories(sess *storage.SessionSummary, reqs []storage.RequestRecor
 				"ended_at":          subEnded,
 				"duration_ms":       subDurationMs,
 			}
+			subID := fmt.Sprintf("%s#subagent-%d", sess.SessionID, idx+1)
 			for _, pr := range group {
 				if v := firstNonEmpty(pr.rec.ClientIP, pr.parsed.ClientIP); v != "" {
 					subClientIP = v
@@ -410,6 +422,18 @@ func BuildTrajectories(sess *storage.SessionSummary, reqs []storage.RequestRecor
 					subModel = pr.parsed.Model
 				} else if pr.rec.Model != "" {
 					subModel = pr.rec.Model
+				}
+				if pr.parsed.Metadata != nil {
+					if sid, _ := pr.parsed.Metadata["subagent_id"].(string); strings.TrimSpace(sid) != "" {
+						subID = strings.TrimSpace(sid)
+						subExtra["subagent_id"] = subID
+					}
+					if kind, _ := pr.parsed.Metadata["subagent_kind"].(string); strings.TrimSpace(kind) != "" {
+						subExtra["subagent_kind"] = strings.TrimSpace(kind)
+					}
+					if name, _ := pr.parsed.Metadata["agent_name"].(string); strings.TrimSpace(name) != "" {
+						subExtra["agent_name"] = strings.TrimSpace(name)
+					}
 				}
 				mergeSessionMetadata(subExtra, pr.parsed.Metadata)
 			}
@@ -431,7 +455,6 @@ func BuildTrajectories(sess *storage.SessionSummary, reqs []storage.RequestRecor
 			if len(subAgentExtra) > 0 {
 				subAgent.Extra = subAgentExtra
 			}
-			subID := fmt.Sprintf("%s#subagent-%d", sess.SessionID, idx+1)
 			subagentTrajs = append(subagentTrajs, &Trajectory{
 				SchemaVersion: SchemaVersion,
 				TrajectoryID:  subID,
@@ -482,6 +505,14 @@ func shouldStartNewSegment(prev, curr parsedRecord) bool {
 	if !toolDefinitionsEqual(prev.parsed.ToolDefinitions, curr.parsed.ToolDefinitions) {
 		return true
 	}
+	if isChainedByPreviousResponseID(prev, curr) {
+		prevSys := leadingSystemContent(prev.parsed.RequestMessages)
+		currSys := leadingSystemContent(curr.parsed.RequestMessages)
+		if prevSys != "" && currSys != "" && prevSys != currSys {
+			return true
+		}
+		return false
+	}
 	prevMsgs := prev.parsed.RequestMessages
 	currMsgs := curr.parsed.RequestMessages
 	if len(prevMsgs) == 0 {
@@ -501,6 +532,21 @@ func shouldStartNewSegment(prev, curr parsedRecord) bool {
 		}
 	}
 	return false
+}
+
+func isChainedByPreviousResponseID(prev, curr parsedRecord) bool {
+	if prev.parsed.ResponseID == "" || curr.parsed.Metadata == nil {
+		return false
+	}
+	prevRespID, _ := curr.parsed.Metadata["previous_response_id"].(string)
+	return prevRespID != "" && prevRespID == prev.parsed.ResponseID
+}
+
+func leadingSystemContent(msgs []proxy.ParsedMessage) string {
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		return msgs[0].Content
+	}
+	return ""
 }
 
 func toolDefinitionsEqual(a, b []map[string]any) bool {
@@ -529,13 +575,24 @@ func buildSteps(
 	lastAgentIdx := -1
 	var prevMsgs []proxy.ParsedMessage
 
+	var prevRec *parsedRecord
 	for reqIdx, pr := range recs {
 		rec := pr.rec
 		parsed := pr.parsed
 
 		msgs := parsed.RequestMessages
-		startIdx := commonPrefixLen(prevMsgs, msgs)
+		var startIdx int
+		if prevRec != nil && isChainedByPreviousResponseID(*prevRec, pr) {
+			startIdx = 0
+			if len(msgs) > 0 && msgs[0].Role == "system" && leadingSystemContent(prevMsgs) == msgs[0].Content {
+				startIdx = 1
+			}
+		} else {
+			startIdx = commonPrefixLen(prevMsgs, msgs)
+		}
 		prevMsgs = msgs
+		currCopy := pr
+		prevRec = &currCopy
 
 		toolIDRemap := map[string]string{}
 
@@ -855,15 +912,29 @@ func attachSubagentsToSegments(segments []*Trajectory, subagentTrajs []*Trajecto
 	for _, seg := range segments {
 		usedIDs[seg.TrajectoryID] = struct{}{}
 	}
-	subIdx := 0
-	for _, seg := range segments {
-		if subIdx >= len(subagentTrajs) {
-			break
-		}
-		for i := range seg.Steps {
-			if subIdx >= len(subagentTrajs) {
-				break
+	assigned := make([]bool, len(subagentTrajs))
+	findSub := func(content string) *Trajectory {
+		for k, sub := range subagentTrajs {
+			if assigned[k] {
+				continue
 			}
+			if sub.Extra != nil {
+				if sid, _ := sub.Extra["subagent_id"].(string); sid != "" && strings.Contains(content, sid) {
+					assigned[k] = true
+					return sub
+				}
+			}
+		}
+		for k, sub := range subagentTrajs {
+			if !assigned[k] {
+				assigned[k] = true
+				return sub
+			}
+		}
+		return nil
+	}
+	for _, seg := range segments {
+		for i := range seg.Steps {
 			step := &seg.Steps[i]
 			if step.Source != "agent" || step.Observation == nil {
 				continue
@@ -873,18 +944,17 @@ func attachSubagentsToSegments(segments []*Trajectory, subagentTrajs []*Trajecto
 				toolNameByID[tc.ToolCallID] = strings.ToLower(tc.FunctionName)
 			}
 			for j := range step.Observation.Results {
-				if subIdx >= len(subagentTrajs) {
-					break
-				}
 				res := &step.Observation.Results[j]
 				fnName := toolNameByID[res.SourceCallID]
 				m := reTaskID.FindStringSubmatch(res.Content)
-				isSubagentCall := len(m) > 1 || fnName == "task" || fnName == "subagent" || fnName == "agent"
+				isSubagentCall := len(m) > 1 || fnName == "task" || fnName == "subagent" || fnName == "agent" || fnName == "spawn_agent"
 				if !isSubagentCall {
 					continue
 				}
-				sub := subagentTrajs[subIdx]
-				subIdx++
+				sub := findSub(res.Content)
+				if sub == nil {
+					break
+				}
 				if len(m) > 1 && strings.TrimSpace(m[1]) != "" {
 					taskID := strings.TrimSpace(m[1])
 					sub.SessionID = taskID
@@ -901,10 +971,11 @@ func attachSubagentsToSegments(segments []*Trajectory, subagentTrajs []*Trajecto
 			}
 		}
 	}
-	for subIdx < len(subagentTrajs) {
+	for k, sub := range subagentTrajs {
+		if assigned[k] {
+			continue
+		}
 		lastSeg := segments[len(segments)-1]
-		sub := subagentTrajs[subIdx]
-		subIdx++
 		usedIDs[sub.TrajectoryID] = struct{}{}
 		lastSeg.SubagentTrajectories = append(lastSeg.SubagentTrajectories, sub)
 	}
@@ -1003,6 +1074,7 @@ func mergeSessionMetadata(dst, src map[string]any) {
 		"sandbox",
 		"sandbox_type",
 		"fixed_model",
+		"prompt_cache_key",
 	}
 	for _, k := range keys {
 		if v, ok := src[k]; ok {

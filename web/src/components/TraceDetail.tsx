@@ -315,6 +315,35 @@ function SpanTreeRow({
   );
 }
 
+function HeaderPillTooltip({
+  label,
+  value,
+  subValue,
+}: {
+  label: string;
+  value: string;
+  subValue?: string;
+}) {
+  return (
+    <span
+      role="tooltip"
+      className="pointer-events-none invisible opacity-0 group-hover:visible group-hover:opacity-100 transition-opacity duration-150 absolute left-0 top-full mt-1.5 z-50 w-max max-w-[min(28rem,calc(100vw-2rem))] rounded-md border border-slate-200 dark:border-slate-700 bg-slate-900 dark:bg-slate-800 px-2.5 py-1.5 text-left font-sans text-[11px] leading-snug text-white dark:text-slate-100 shadow-lg"
+    >
+      <span className="block text-[10px] font-medium text-slate-300 dark:text-slate-400">
+        {label}
+      </span>
+      <span className="mt-0.5 block font-mono break-all text-white dark:text-slate-100">
+        {value}
+      </span>
+      {subValue && (
+        <span className="mt-0.5 block font-mono break-all text-sky-300">
+          {subValue}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function CopyButton({ text, label }: { text: string; label?: string }) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
@@ -589,7 +618,7 @@ function ToolDefinitionsPanel({
   );
 }
 
-function AgentOverviewPanel({ span }: { span: SpanNode }) {
+function AgentOverviewPanel({ span, upstreamUrl }: { span: SpanNode; upstreamUrl?: string }) {
   const { lang, t } = useI18n();
   const locale = lang === 'zh' ? 'zh-CN' : 'en-US';
   const meta = span.metadata;
@@ -610,7 +639,7 @@ function AgentOverviewPanel({ span }: { span: SpanNode }) {
   const llmCallCount = typeof meta?.llmCallCount === 'number' ? meta.llmCallCount : undefined;
   const subagentCount = typeof meta?.subagentCount === 'number' ? meta.subagentCount : undefined;
 
-  const coreRows: Array<{ label: string; value: string; highlight?: boolean; fullWidth?: boolean; copyText?: string }> = [
+  const coreRows: Array<{ label: string; value: string; highlight?: boolean; fullWidth?: boolean; copyText?: string; title?: string }> = [
     ...(typeof meta?.sessionId === 'string' && meta.sessionId
       ? [{ label: t('detail.metaSessionId'), value: meta.sessionId }]
       : []),
@@ -635,7 +664,7 @@ function AgentOverviewPanel({ span }: { span: SpanNode }) {
         ]
       : []),
     ...(typeof meta?.upstream === 'string' && meta.upstream
-      ? [{ label: t('detail.metaUpstream'), value: meta.upstream }]
+      ? [{ label: t('detail.metaUpstream'), value: meta.upstream, title: upstreamUrl || undefined }]
       : []),
     ...(typeof meta?.clientIp === 'string' && meta.clientIp
       ? [{ label: t('detail.metaClientIp'), value: meta.clientIp }]
@@ -698,6 +727,7 @@ function AgentOverviewPanel({ span }: { span: SpanNode }) {
                 {row.copyText && <CopyButton text={row.copyText} />}
               </div>
               <div
+                title={row.title}
                 className={`mt-0.5 font-mono break-all ${
                   row.highlight
                     ? 'font-semibold text-emerald-700 dark:text-emerald-300'
@@ -734,9 +764,11 @@ function AgentOverviewPanel({ span }: { span: SpanNode }) {
 
 function LlmMetadataStrip({
   span,
+  upstreamUrl,
   onOpenHttp,
 }: {
   span: SpanNode;
+  upstreamUrl?: string;
   onOpenHttp?: () => void;
 }) {
   const { t } = useI18n();
@@ -868,7 +900,7 @@ function LlmMetadataStrip({
             </span>
           )}
           {upstream && (
-            <span>
+            <span title={upstreamUrl || undefined}>
               <span className="text-slate-500">{t('detail.metaUpstream')}:</span>{' '}
               <span className="font-mono text-slate-800 dark:text-slate-200">{upstream}</span>
             </span>
@@ -1055,6 +1087,7 @@ export function TraceDetail({
   const { lang, t } = useI18n();
   const locale = lang === 'zh' ? 'zh-CN' : 'en-US';
   const [trajectories, setTrajectories] = useState<AtifTrajectory[]>([]);
+  const [upstreamUrl, setUpstreamUrl] = useState<string>('');
   const [sessionLlmCallCount, setSessionLlmCallCount] = useState<number | undefined>(undefined);
   const [selectedSegmentIdx, setSelectedSegmentIdx] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -1073,8 +1106,10 @@ export function TraceDetail({
     setLoading(true);
     setError(null);
     setTrajectories([]);
+    setUpstreamUrl('');
     setSessionLlmCallCount(undefined);
     setSelectedSegmentIdx(0);
+    setViewMode('prism');
     setSelectedSpanId(null);
     setActiveTab('overview');
     setCollapsed(new Set());
@@ -1086,6 +1121,7 @@ export function TraceDetail({
       .then((res) => {
         if (cancelled) return;
         setTrajectories(res.trajectories ?? []);
+        setUpstreamUrl(res.upstream_url ?? '');
         setSessionLlmCallCount(res.llm_call_count);
         setSelectedSegmentIdx(0);
       })
@@ -1320,7 +1356,8 @@ export function TraceDetail({
               <CopyButton text={sessionId} />
 
               <span
-                className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs font-medium ${harnessBadgeColor(
+                title={`${t('detail.pillHarness')}: ${sessionSummary.harness}${sessionSummary.agentVersion && sessionSummary.agentVersion !== 'unknown' ? ` v${sessionSummary.agentVersion}` : ''}`}
+                className={`relative group inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs font-medium ${harnessBadgeColor(
                   sessionSummary.harness
                 )}`}
               >
@@ -1330,61 +1367,97 @@ export function TraceDetail({
                     v{sessionSummary.agentVersion}
                   </span>
                 )}
+                <HeaderPillTooltip
+                  label={t('detail.pillHarness')}
+                  value={`${sessionSummary.harness}${sessionSummary.agentVersion && sessionSummary.agentVersion !== 'unknown' ? ` v${sessionSummary.agentVersion}` : ''}`}
+                />
               </span>
 
-              <span className="rounded-md border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/80 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:text-slate-300">
+              <span
+                title={`${t('detail.pillSchema')}: ${sessionSummary.schemaVersion}`}
+                className="relative group rounded-md border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/80 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:text-slate-300"
+              >
                 {sessionSummary.schemaVersion}
+                <HeaderPillTooltip
+                  label={t('detail.pillSchema')}
+                  value={sessionSummary.schemaVersion}
+                />
               </span>
             </div>
 
             <div className="flex flex-wrap items-center gap-2 text-xs">
               {sessionSummary.upstream && (
                 <span
-                  title={t('detail.metaUpstream')}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/70 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:text-slate-300"
+                  title={
+                    upstreamUrl
+                      ? `${t('detail.pillUpstream')}: ${sessionSummary.upstream} — ${upstreamUrl}`
+                      : `${t('detail.pillUpstream')}: ${sessionSummary.upstream}`
+                  }
+                  className="relative group inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/70 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:text-slate-300"
                 >
                   <Server className="h-3 w-3 text-slate-400 dark:text-slate-500" />
                   {sessionSummary.upstream}
+                  <HeaderPillTooltip
+                    label={t('detail.pillUpstream')}
+                    value={sessionSummary.upstream}
+                    subValue={upstreamUrl || undefined}
+                  />
                 </span>
               )}
 
               {sessionSummary.modelName && (
                 <span
-                  title={t('detail.statModel')}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/70 px-2 py-0.5 font-mono text-[11px] text-slate-800 dark:text-slate-200"
+                  title={`${t('detail.pillModel')}: ${sessionSummary.modelName}`}
+                  className="relative group inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/70 px-2 py-0.5 font-mono text-[11px] text-slate-800 dark:text-slate-200"
                 >
                   <Cpu className="h-3 w-3 text-indigo-500 dark:text-indigo-400" />
                   {sessionSummary.modelName}
+                  <HeaderPillTooltip
+                    label={t('detail.pillModel')}
+                    value={sessionSummary.modelName}
+                  />
                 </span>
               )}
 
               {sessionSummary.apiKeyHash && (
                 <span
-                  title={`${t('detail.metaApiKeyHash')}: ${sessionSummary.apiKeyHash}`}
-                  className="inline-flex items-center gap-1 rounded-md border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 px-2 py-0.5 font-mono text-[11px] font-medium text-amber-800 dark:text-amber-300"
+                  title={`${t('detail.pillApiKeyHash')}: ${sessionSummary.apiKeyHash}`}
+                  className="relative group inline-flex items-center gap-1 rounded-md border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 px-2 py-0.5 font-mono text-[11px] font-medium text-amber-800 dark:text-amber-300"
                 >
                   <KeyRound className="h-3 w-3 text-amber-600 dark:text-amber-400" />
                   {shortApiKeyHash(sessionSummary.apiKeyHash)}
+                  <HeaderPillTooltip
+                    label={t('detail.pillApiKeyHash')}
+                    value={sessionSummary.apiKeyHash}
+                  />
                 </span>
               )}
 
               {sessionSummary.clientIp && (
                 <span
-                  title={t('detail.metaClientIp')}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/70 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:text-slate-300"
+                  title={`${t('detail.pillClientIp')}: ${sessionSummary.clientIp}`}
+                  className="relative group inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/70 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:text-slate-300"
                 >
                   <Network className="h-3 w-3 text-slate-400 dark:text-slate-500" />
                   {sessionSummary.clientIp}
+                  <HeaderPillTooltip
+                    label={t('detail.pillClientIp')}
+                    value={sessionSummary.clientIp}
+                  />
                 </span>
               )}
 
               {sessionSummary.workDir && (
                 <span
-                  title={sessionSummary.workDir}
-                  className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-slate-200/80 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50 px-2 py-0.5 font-mono text-[11px] text-slate-600 dark:text-slate-400"
+                  title={`${t('detail.pillWorkDir')}: ${sessionSummary.workDir}`}
+                  className="relative group inline-flex max-w-full items-center gap-1.5 rounded-md border border-slate-200/80 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50 px-2 py-0.5 font-mono text-[11px] text-slate-600 dark:text-slate-400"
                 >
                   <FolderOpen className="h-3 w-3 shrink-0 text-slate-400 dark:text-slate-500" />
                   <span className="truncate">{sessionSummary.workDir}</span>
+                  <HeaderPillTooltip
+                    label={t('detail.pillWorkDir')}
+                    value={sessionSummary.workDir}
+                  />
                 </span>
               )}
             </div>
@@ -1964,13 +2037,14 @@ export function TraceDetail({
 
                 <div className="max-h-[64vh] overflow-y-auto p-4 space-y-4">
                   {activeTab === 'overview' && selectedSpan.type === 'agent_invocation' && (
-                    <AgentOverviewPanel span={selectedSpan} />
+                    <AgentOverviewPanel span={selectedSpan} upstreamUrl={upstreamUrl} />
                   )}
 
                   {activeTab === 'overview' && selectedSpan.type === 'llm_call' && (
                     <>
                       <LlmMetadataStrip
                         span={selectedSpan}
+                        upstreamUrl={upstreamUrl}
                         onOpenHttp={
                           selectedRequestRecordId !== undefined
                             ? () => setActiveTab('http')

@@ -10,6 +10,7 @@ export interface TraceSummary {
   harness: string;
   work_dir: string;
   upstream: string;
+  upstream_url?: string;
   model: string;
   step_count: number;
   request_count: number;
@@ -143,6 +144,7 @@ export interface AtifTrajectory {
 
 export interface TraceTrajectoriesResponse {
   session_id: string;
+  upstream_url?: string;
   llm_call_count?: number;
   trajectories: AtifTrajectory[];
 }

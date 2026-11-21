@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useRef } from 'react';
 import {
   Search,
   Download,
@@ -16,6 +16,7 @@ import {
   KeyRound,
   Network,
   Sparkles,
+  X,
 } from 'lucide-react';
 import type { TraceSummary } from '../types';
 import {
@@ -78,8 +79,11 @@ export function TraceList({
   const { lang, t } = useI18n();
   const locale = lang === 'zh' ? 'zh-CN' : 'en-US';
 
+  const knownHarnessesRef = useRef<Set<string>>(new Set());
+  const knownUpstreamsRef = useRef<Set<string>>(new Set());
+
   const harnesses = useMemo(() => {
-    const s = new Set<string>();
+    const s = knownHarnessesRef.current;
     traces.forEach((tr) => {
       if (tr.harness) s.add(tr.harness);
     });
@@ -88,13 +92,21 @@ export function TraceList({
   }, [traces, harnessFilter]);
 
   const upstreams = useMemo(() => {
-    const s = new Set<string>();
+    const s = knownUpstreamsRef.current;
     traces.forEach((tr) => {
       if (tr.upstream) s.add(tr.upstream);
     });
     if (upstreamFilter) s.add(upstreamFilter);
     return Array.from(s).sort();
   }, [traces, upstreamFilter]);
+
+  const hasActiveFilters = Boolean(query.trim() || harnessFilter || upstreamFilter);
+
+  function handleClearFilters() {
+    if (query) onQueryChange('');
+    if (harnessFilter) onHarnessChange('');
+    if (upstreamFilter) onUpstreamChange('');
+  }
 
   const allVisibleSelected =
     traces.length > 0 && traces.every((tr) => selectedIds.has(tr.session_id));
@@ -146,6 +158,17 @@ export function TraceList({
               </option>
             ))}
           </select>
+
+          {hasActiveFilters && (
+            <button
+              type="button"
+              onClick={handleClearFilters}
+              className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800/80 px-2.5 py-2 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700/80 hover:text-slate-900 dark:hover:text-slate-100 transition-colors cursor-pointer"
+            >
+              <X className="h-3.5 w-3.5" />
+              {t('list.clearFilters')}
+            </button>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -183,7 +206,7 @@ export function TraceList({
           <table className="w-full text-left text-sm">
             <thead>
               <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/90 text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                <th className="w-10 px-4 py-3">
+                <th className="w-9 px-3 py-3">
                   <button
                     type="button"
                     onClick={onToggleSelectAll}
@@ -199,14 +222,14 @@ export function TraceList({
                     )}
                   </button>
                 </th>
-                <th className="px-4 py-3 font-medium">{t('list.colSession')}</th>
-                <th className="px-4 py-3 font-medium">{t('list.colHarness')}</th>
-                <th className="px-4 py-3 font-medium">{t('list.colUpstreamModel')}</th>
-                <th className="px-4 py-3 font-medium">{t('list.colClientKey')}</th>
-                <th className="px-4 py-3 font-medium text-right">{t('list.colSteps')}</th>
-                <th className="px-4 py-3 font-medium text-right">{t('list.colTokens')}</th>
-                <th className="px-4 py-3 font-medium text-right">{t('list.colUpdated')}</th>
-                <th className="w-24 px-4 py-3 font-medium text-right">{t('list.colActions')}</th>
+                <th className="px-3 py-3 font-medium whitespace-nowrap">{t('list.colSession')}</th>
+                <th className="px-3 py-3 font-medium whitespace-nowrap">{t('list.colHarness')}</th>
+                <th className="px-3 py-3 font-medium whitespace-nowrap">{t('list.colUpstreamModel')}</th>
+                <th className="px-3 py-3 font-medium whitespace-nowrap">{t('list.colClientKey')}</th>
+                <th className="px-3 py-3 font-medium text-right whitespace-nowrap">{t('list.colSteps')}</th>
+                <th className="px-3 py-3 font-medium text-right whitespace-nowrap">{t('list.colTokens')}</th>
+                <th className="px-3 py-3 font-medium text-right whitespace-nowrap">{t('list.colUpdated')}</th>
+                <th className="w-20 px-3 py-3 font-medium text-right whitespace-nowrap">{t('list.colActions')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 dark:divide-slate-800/70">
@@ -245,7 +268,7 @@ export function TraceList({
                       }`}
                     >
                       <td
-                        className="px-4 py-3.5"
+                        className="px-3 py-3"
                         onClick={(e) => {
                           e.stopPropagation();
                           onToggleSelect(trace.session_id);
@@ -264,9 +287,9 @@ export function TraceList({
                         </button>
                       </td>
 
-                      <td className="px-4 py-3.5">
+                      <td className="px-3 py-3">
                         <div className="flex items-center gap-2">
-                          <span className="font-mono text-xs font-medium text-indigo-600 group-hover:text-indigo-700 dark:text-indigo-300 dark:group-hover:text-indigo-200">
+                          <span className="font-mono text-xs font-medium text-indigo-600 group-hover:text-indigo-700 dark:text-indigo-300 dark:group-hover:text-indigo-200 truncate max-w-[200px]" title={trace.session_id}>
                             {trace.session_id}
                           </span>
                           {trace.trajectory_count !== undefined && trace.trajectory_count > 1 && (
@@ -280,7 +303,7 @@ export function TraceList({
                         </div>
                         {trace.work_dir && (
                           <div
-                            className="mt-1 flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 max-w-sm truncate"
+                            className="mt-1 flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 max-w-[230px] truncate"
                             title={trace.work_dir}
                           >
                             <FolderOpen className="h-3 w-3 shrink-0 text-slate-400 dark:text-slate-500" />
@@ -289,9 +312,9 @@ export function TraceList({
                         )}
                       </td>
 
-                      <td className="px-4 py-3.5">
+                      <td className="px-3 py-3 whitespace-nowrap">
                         <span
-                          className={`inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-medium ${harnessBadgeColor(
+                          className={`inline-flex items-center whitespace-nowrap rounded-md border px-2 py-0.5 text-xs font-medium ${harnessBadgeColor(
                             trace.harness
                           )}`}
                         >
@@ -299,19 +322,22 @@ export function TraceList({
                         </span>
                       </td>
 
-                      <td className="px-4 py-3.5">
+                      <td className="px-3 py-3">
                         <div className="flex items-center gap-1.5 text-xs text-slate-800 dark:text-slate-200">
                           <Cpu className="h-3.5 w-3.5 text-slate-400 dark:text-slate-500 shrink-0" />
-                          <span className="font-mono truncate max-w-[200px]" title={trace.model}>
+                          <span className="font-mono truncate max-w-[165px]" title={trace.model}>
                             {trace.model || '—'}
                           </span>
                         </div>
-                        <div className="mt-0.5 text-[11px] text-slate-500 font-mono">
+                        <div
+                          className="mt-0.5 text-[11px] text-slate-500 font-mono"
+                          title={trace.upstream_url || undefined}
+                        >
                           {trace.upstream || '—'}
                         </div>
                       </td>
 
-                      <td className="px-4 py-3.5 whitespace-nowrap">
+                      <td className="px-3 py-3 whitespace-nowrap">
                         {trace.client_ip || trace.api_key_hash ? (
                           <div className="space-y-1">
                             {trace.client_ip && (
@@ -337,7 +363,7 @@ export function TraceList({
                         )}
                       </td>
 
-                      <td className="px-4 py-3.5 text-right whitespace-nowrap">
+                      <td className="px-3 py-3 text-right whitespace-nowrap">
                         {(() => {
                           const llmCalls = trace.llm_call_count ?? trace.request_count;
                           return (
@@ -361,7 +387,7 @@ export function TraceList({
                         })()}
                       </td>
 
-                      <td className="px-4 py-3.5 text-right whitespace-nowrap font-mono text-xs">
+                      <td className="px-3 py-3 text-right whitespace-nowrap font-mono text-xs">
                         <div className="text-slate-800 dark:text-slate-200">
                           <span title={t('list.promptTokens')}>
                             {formatTokensCompact(trace.total_prompt_tokens)}
@@ -390,7 +416,7 @@ export function TraceList({
                         </div>
                       </td>
 
-                      <td className="px-4 py-3.5 text-right whitespace-nowrap">
+                      <td className="px-3 py-3 text-right whitespace-nowrap">
                         <div className="inline-flex items-center gap-1 text-xs text-slate-600 dark:text-slate-300">
                           <Clock className="h-3 w-3 text-slate-400 dark:text-slate-500" />
                           {formatTimestamp(trace.updated_at || trace.started_at, locale)}
@@ -398,7 +424,7 @@ export function TraceList({
                       </td>
 
                       <td
-                        className="px-4 py-3.5 text-right whitespace-nowrap"
+                        className="px-3 py-3 text-right whitespace-nowrap"
                         onClick={(e) => e.stopPropagation()}
                       >
                         <div className="inline-flex items-center gap-1">

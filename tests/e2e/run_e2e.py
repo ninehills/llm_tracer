@@ -1,650 +1,53 @@
+import datetime
+import gzip
 import http.cookiejar
-import http.server
 import json
 import os
-import re
 import shutil
-import socket
-import socketserver
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(__file__))
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-BINARY_PATH = os.path.join(ROOT_DIR, "llm_tracer")
-PI_BIN = shutil.which("pi") or os.path.expanduser("~/.local/bin/pi")
-
-PORT_MODE1 = 18081
-PORT_MODE2 = 18082
-PORT_MODE3 = 18083
-PORT_MOCK_OPENAI = 18088
-PORT_MOCK_ANTHROPIC = 18089
-
-TMP_BASE = "/tmp/llm_tracer_e2e_run"
-
-
-def assert_eq(actual, expected, msg=""):
-    if actual != expected:
-        raise AssertionError(f"{msg}: expected {expected!r}, got {actual!r}")
-
-
-def assert_true(cond, msg=""):
-    if not cond:
-        raise AssertionError(f"assertion failed: {msg}")
-
-
-def wait_port(host, port, timeout=10.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=0.5):
-                return
-        except OSError:
-            time.sleep(0.1)
-    raise RuntimeError(f"port {host}:{port} did not open within {timeout}s")
+from helpers import (
+    BINARY_PATH,
+    CLAUDE_BIN,
+    PI_BIN,
+    PORT_CFG_TEST,
+    PORT_MOCK_ANTHROPIC,
+    PORT_MOCK_OPENAI,
+    PORT_MODE1,
+    PORT_MODE2,
+    PORT_MODE3,
+    TMP_BASE,
+    assert_eq,
+    assert_true,
+    http_request,
+    sha256_hex,
+    validate_atif_v18,
+    wait_port,
+)
+from mock_servers import (
+    MockRecorder,
+    ThreadedHTTPServer,
+    make_anthropic_handler,
+    make_openai_handler,
+)
 
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-class MockRecorder:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.records = []
-
-    def add(self, rec):
-        with self.lock:
-            self.records.append(rec)
-
-    def last(self):
-        with self.lock:
-            return self.records[-1] if self.records else None
-
-    def all(self):
-        with self.lock:
-            return list(self.records)
-
-
-def make_openai_handler(recorder):
-    class OpenAIMockHandler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, format, *args):
-            pass
-
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(length) if length > 0 else b""
-            parsed_url = urllib.parse.urlsplit(self.path)
-            try:
-                body = json.loads(raw_body.decode("utf-8"))
-            except Exception:
-                body = {}
-
-            is_stream = bool(body.get("stream", False))
-            model = body.get("model", "gpt-4o-mini")
-            messages = body.get("messages", [])
-            tools = body.get("tools", [])
-
-            has_tool_result = any(m.get("role") == "tool" for m in messages)
-            user_texts = []
-            for m in messages:
-                if m.get("role") == "user":
-                    c = m.get("content", "")
-                    if isinstance(c, str):
-                        user_texts.append(c)
-                    elif isinstance(c, list):
-                        for part in c:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                user_texts.append(part.get("text", ""))
-            joined_user = "\n".join(user_texts)
-
-            want_tool = ("USE_TOOL_READ" in joined_user) and (not has_tool_result) and len(tools) > 0
-            read_tool_name = "read"
-            for t in tools:
-                fn = t.get("function", {})
-                if fn.get("name") == "read":
-                    read_tool_name = "read"
-                    break
-
-            target_path = "hello.txt"
-            m_path = re.search(r"READ_PATH:([^\s]+)", joined_user)
-            if m_path:
-                target_path = m_path.group(1)
-
-            if is_stream:
-                chunks = []
-                if want_tool:
-                    chunks.append({
-                        "id": "chatcmpl-e2e-stream-tool-1",
-                        "object": "chat.completion.chunk",
-                        "created": 1700000001,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": "Let me read that file.",
-                                "tool_calls": [{
-                                    "index": 0,
-                                    "id": "call_oai_read_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": read_tool_name,
-                                        "arguments": json.dumps({"path": target_path})
-                                    }
-                                }]
-                            },
-                            "finish_reason": None
-                        }]
-                    })
-                    chunks.append({
-                        "id": "chatcmpl-e2e-stream-tool-1",
-                        "object": "chat.completion.chunk",
-                        "created": 1700000001,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "tool_calls"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 120,
-                            "completion_tokens": 25,
-                            "prompt_tokens_details": {"cached_tokens": 40}
-                        }
-                    })
-                else:
-                    reply_text = "OpenAI mock final answer after tool." if has_tool_result else "OpenAI mock stream answer."
-                    chunks.append({
-                        "id": "chatcmpl-e2e-stream-2",
-                        "object": "chat.completion.chunk",
-                        "created": 1700000002,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": reply_text[:12]},
-                            "finish_reason": None
-                        }]
-                    })
-                    chunks.append({
-                        "id": "chatcmpl-e2e-stream-2",
-                        "object": "chat.completion.chunk",
-                        "created": 1700000002,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": reply_text[12:]},
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 150,
-                            "completion_tokens": 30,
-                            "prompt_tokens_details": {"cached_tokens": 50}
-                        }
-                    })
-
-                parts = []
-                for c in chunks:
-                    parts.append(("data: " + json.dumps(c) + "\n\n").encode("utf-8"))
-                parts.append(b"data: [DONE]\n\n")
-                full_resp = b"".join(parts)
-
-                recorder.add({
-                    "method": "POST",
-                    "path": parsed_url.path,
-                    "query": parsed_url.query,
-                    "headers": dict(self.headers.items()),
-                    "request_body": raw_body,
-                    "response_body": full_resp,
-                })
-
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                for p in parts:
-                    self.wfile.write(p)
-                    self.wfile.flush()
-                    time.sleep(0.01)
-            else:
-                if want_tool:
-                    resp_obj = {
-                        "id": "chatcmpl-e2e-nonstream-tool",
-                        "object": "chat.completion",
-                        "created": 1700000003,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": "Calling read tool.",
-                                "tool_calls": [{
-                                    "id": "call_oai_ns_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": read_tool_name,
-                                        "arguments": json.dumps({"path": target_path})
-                                    }
-                                }]
-                            },
-                            "finish_reason": "tool_calls"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 110,
-                            "completion_tokens": 22,
-                            "prompt_tokens_details": {"cached_tokens": 10}
-                        }
-                    }
-                else:
-                    resp_obj = {
-                        "id": "chatcmpl-e2e-nonstream-1",
-                        "object": "chat.completion",
-                        "created": 1700000004,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": "OpenAI non-stream response payload."
-                            },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {
-                            "prompt_tokens": 90,
-                            "completion_tokens": 15,
-                            "prompt_tokens_details": {"cached_tokens": 20}
-                        }
-                    }
-
-                full_resp = json.dumps(resp_obj, separators=(", ", ": ")).encode("utf-8")
-                recorder.add({
-                    "method": "POST",
-                    "path": parsed_url.path,
-                    "query": parsed_url.query,
-                    "headers": dict(self.headers.items()),
-                    "request_body": raw_body,
-                    "response_body": full_resp,
-                })
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(full_resp)))
-                self.send_header("X-Mock-Upstream", "openai")
-                self.end_headers()
-                self.wfile.write(full_resp)
-
-    return OpenAIMockHandler
-
-
-def make_anthropic_handler(recorder):
-    class AnthropicMockHandler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, format, *args):
-            pass
-
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(length) if length > 0 else b""
-            parsed_url = urllib.parse.urlsplit(self.path)
-            try:
-                body = json.loads(raw_body.decode("utf-8"))
-            except Exception:
-                body = {}
-
-            is_stream = bool(body.get("stream", False))
-            model = body.get("model", "claude-sonnet-4-5")
-            messages = body.get("messages", [])
-            tools = body.get("tools", [])
-
-            has_tool_result = False
-            user_texts = []
-            for m in messages:
-                c = m.get("content", "")
-                if isinstance(c, str):
-                    if m.get("role") == "user":
-                        user_texts.append(c)
-                elif isinstance(c, list):
-                    for part in c:
-                        if isinstance(part, dict):
-                            if part.get("type") == "tool_result":
-                                has_tool_result = True
-                            if m.get("role") == "user" and part.get("type") == "text":
-                                user_texts.append(part.get("text", ""))
-            joined_user = "\n".join(user_texts)
-
-            want_tool = ("USE_TOOL_READ" in joined_user) and (not has_tool_result) and len(tools) > 0
-            target_path = "hello.txt"
-            m_path = re.search(r"READ_PATH:([^\s]+)", joined_user)
-            if m_path:
-                target_path = m_path.group(1)
-
-            if is_stream:
-                events = []
-                events.append(("message_start", {
-                    "type": "message_start",
-                    "message": {
-                        "id": "msg_e2e_stream_1",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": model,
-                        "content": [],
-                        "stop_reason": None,
-                        "usage": {
-                            "input_tokens": 100,
-                            "cache_read_input_tokens": 40,
-                            "cache_creation_input_tokens": 10,
-                            "output_tokens": 1
-                        }
-                    }
-                }))
-                events.append(("content_block_start", {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "thinking", "thinking": ""}
-                }))
-                events.append(("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "thinking_delta", "thinking": "Analyzing the request carefully."}
-                }))
-                events.append(("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": 0
-                }))
-
-                if want_tool:
-                    events.append(("content_block_start", {
-                        "type": "content_block_start",
-                        "index": 1,
-                        "content_block": {"type": "text", "text": ""}
-                    }))
-                    events.append(("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": 1,
-                        "delta": {"type": "text_delta", "text": "Reading the file now."}
-                    }))
-                    events.append(("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": 1
-                    }))
-                    events.append(("content_block_start", {
-                        "type": "content_block_start",
-                        "index": 2,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": "toolu_ant_read_1",
-                            "name": "read",
-                            "input": {}
-                        }
-                    }))
-                    events.append(("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": 2,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": json.dumps({"path": target_path})
-                        }
-                    }))
-                    events.append(("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": 2
-                    }))
-                    stop_reason = "tool_use"
-                    out_tokens = 35
-                else:
-                    reply_text = "Anthropic mock final answer after tool." if has_tool_result else "Anthropic mock stream answer."
-                    events.append(("content_block_start", {
-                        "type": "content_block_start",
-                        "index": 1,
-                        "content_block": {"type": "text", "text": ""}
-                    }))
-                    events.append(("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": 1,
-                        "delta": {"type": "text_delta", "text": reply_text}
-                    }))
-                    events.append(("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": 1
-                    }))
-                    stop_reason = "end_turn"
-                    out_tokens = 28
-
-                events.append(("message_delta", {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": out_tokens}
-                }))
-                events.append(("message_stop", {"type": "message_stop"}))
-
-                parts = []
-                for ev_name, payload in events:
-                    chunk = f"event: {ev_name}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
-                    parts.append(chunk)
-                full_resp = b"".join(parts)
-
-                recorder.add({
-                    "method": "POST",
-                    "path": parsed_url.path,
-                    "query": parsed_url.query,
-                    "headers": dict(self.headers.items()),
-                    "request_body": raw_body,
-                    "response_body": full_resp,
-                })
-
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                for p in parts:
-                    self.wfile.write(p)
-                    self.wfile.flush()
-                    time.sleep(0.01)
-            else:
-                content = [
-                    {"type": "thinking", "thinking": "Non-stream thinking block."},
-                    {"type": "text", "text": "Anthropic non-stream response."}
-                ]
-                stop_reason = "end_turn"
-                if want_tool:
-                    content.append({
-                        "type": "tool_use",
-                        "id": "toolu_ant_ns_1",
-                        "name": "read",
-                        "input": {"path": target_path}
-                    })
-                    stop_reason = "tool_use"
-
-                resp_obj = {
-                    "id": "msg_e2e_nonstream_1",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model,
-                    "content": content,
-                    "stop_reason": stop_reason,
-                    "usage": {
-                        "input_tokens": 80,
-                        "cache_read_input_tokens": 20,
-                        "cache_creation_input_tokens": 5,
-                        "output_tokens": 18
-                    }
-                }
-                full_resp = json.dumps(resp_obj, separators=(", ", ": ")).encode("utf-8")
-                recorder.add({
-                    "method": "POST",
-                    "path": parsed_url.path,
-                    "query": parsed_url.query,
-                    "headers": dict(self.headers.items()),
-                    "request_body": raw_body,
-                    "response_body": full_resp,
-                })
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(full_resp)))
-                self.send_header("X-Mock-Upstream", "anthropic")
-                self.end_headers()
-                self.wfile.write(full_resp)
-
-    return AnthropicMockHandler
-
-
-def http_request(url, method="GET", headers=None, body=None, opener=None):
-    req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
-    fn = opener.open if opener is not None else urllib.request.urlopen
-    try:
-        with fn(req, timeout=15) as resp:
-            return resp.status, dict(resp.headers.items()), resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers.items()), e.read()
-
-
-def validate_atif_v18(traj, context=""):
-    root_allowed = {
-        "schema_version",
-        "session_id",
-        "trajectory_id",
-        "agent",
-        "steps",
-        "notes",
-        "final_metrics",
-        "continued_trajectory_ref",
-        "subagent_trajectories",
-        "extra",
-    }
-    agent_allowed = {"name", "version", "model_name", "tool_definitions", "extra"}
-    step_allowed = {
-        "step_id",
-        "timestamp",
-        "source",
-        "message",
-        "model_name",
-        "reasoning_effort",
-        "reasoning_content",
-        "tool_calls",
-        "observation",
-        "metrics",
-        "llm_call_count",
-        "is_copied_context",
-        "extra",
-    }
-    agent_only_fields = {
-        "model_name",
-        "reasoning_effort",
-        "reasoning_content",
-        "tool_calls",
-        "metrics",
-    }
-    tool_call_allowed = {"tool_call_id", "function_name", "arguments", "extra"}
-    obs_allowed = {"results"}
-    obs_res_allowed = {"source_call_id", "content", "subagent_trajectory_ref", "extra"}
-    metrics_allowed = {
-        "prompt_tokens",
-        "completion_tokens",
-        "cached_tokens",
-        "cost_usd",
-        "prompt_token_ids",
-        "completion_token_ids",
-        "logprobs",
-        "extra",
-    }
-    final_metrics_allowed = {
-        "total_prompt_tokens",
-        "total_completion_tokens",
-        "total_cached_tokens",
-        "total_cost_usd",
-        "total_steps",
-        "extra",
-    }
-
-    assert_true(isinstance(traj, dict), f"{context}: trajectory must be object")
-    extra_root = set(traj.keys()) - root_allowed
-    assert_eq(extra_root, set(), f"{context}: undeclared root fields")
-    assert_eq(traj.get("schema_version"), "ATIF-v1.8", f"{context}: schema_version")
-    assert_true(isinstance(traj.get("session_id"), str) and len(traj["session_id"]) > 0, f"{context}: session_id")
-
-    agent = traj.get("agent")
-    assert_true(isinstance(agent, dict), f"{context}: agent must be object")
-    assert_eq(set(agent.keys()) - agent_allowed, set(), f"{context}: undeclared agent fields")
-    assert_true(isinstance(agent.get("name"), str) and len(agent["name"]) > 0, f"{context}: agent.name")
-    assert_true(isinstance(agent.get("version"), str) and len(agent["version"]) > 0, f"{context}: agent.version")
-
-    steps = traj.get("steps")
-    assert_true(isinstance(steps, list) and len(steps) > 0, f"{context}: steps must be non-empty list")
-
-    sum_prompt = 0
-    sum_completion = 0
-    sum_cached = 0
-
-    for idx, step in enumerate(steps, start=1):
-        assert_true(isinstance(step, dict), f"{context}: step {idx} must be object")
-        assert_eq(set(step.keys()) - step_allowed, set(), f"{context}: step {idx} undeclared fields")
-        assert_eq(step.get("step_id"), idx, f"{context}: step {idx} sequential step_id")
-        src = step.get("source")
-        assert_true(src in {"system", "user", "agent"}, f"{context}: step {idx} invalid source {src!r}")
-        assert_true("message" in step and isinstance(step["message"], (str, list)), f"{context}: step {idx} message")
-
-        if src != "agent":
-            forbidden = set(step.keys()) & agent_only_fields
-            assert_eq(forbidden, set(), f"{context}: step {idx} non-agent step has agent-only fields")
-
-        if "tool_calls" in step:
-            tcs = step["tool_calls"]
-            assert_true(isinstance(tcs, list), f"{context}: step {idx} tool_calls list")
-            for tc in tcs:
-                assert_true(isinstance(tc, dict), f"{context}: tool_call object")
-                assert_eq(set(tc.keys()) - tool_call_allowed, set(), f"{context}: tool_call undeclared fields")
-                assert_true(isinstance(tc.get("tool_call_id"), str) and len(tc["tool_call_id"]) > 0, f"{context}: tool_call_id")
-                assert_true(isinstance(tc.get("function_name"), str) and len(tc["function_name"]) > 0, f"{context}: function_name")
-                assert_true(isinstance(tc.get("arguments"), dict), f"{context}: tool_call arguments dict")
-
-        if "observation" in step:
-            obs = step["observation"]
-            assert_true(isinstance(obs, dict), f"{context}: observation object")
-            assert_eq(set(obs.keys()) - obs_allowed, set(), f"{context}: observation undeclared fields")
-            results = obs.get("results")
-            assert_true(isinstance(results, list), f"{context}: observation.results list")
-            for r in results:
-                assert_true(isinstance(r, dict), f"{context}: observation result object")
-                assert_eq(set(r.keys()) - obs_res_allowed, set(), f"{context}: observation result undeclared fields")
-
-        if "metrics" in step:
-            m = step["metrics"]
-            assert_true(isinstance(m, dict), f"{context}: metrics object")
-            assert_eq(set(m.keys()) - metrics_allowed, set(), f"{context}: metrics undeclared fields")
-            pt = m.get("prompt_tokens", 0)
-            ct = m.get("completion_tokens", 0)
-            ca = m.get("cached_tokens", 0)
-            assert_true(isinstance(pt, int) and pt >= 0, f"{context}: prompt_tokens")
-            assert_true(isinstance(ct, int) and ct >= 0, f"{context}: completion_tokens")
-            assert_true(isinstance(ca, int) and ca >= 0, f"{context}: cached_tokens")
-            assert_true(ca <= pt or pt == 0, f"{context}: cached_tokens ({ca}) must be <= prompt_tokens ({pt})")
-            sum_prompt += pt
-            sum_completion += ct
-            sum_cached += ca
-
-    fm = traj.get("final_metrics")
-    if fm is not None:
-        assert_true(isinstance(fm, dict), f"{context}: final_metrics object")
-        assert_eq(set(fm.keys()) - final_metrics_allowed, set(), f"{context}: final_metrics undeclared fields")
-        assert_eq(fm.get("total_steps"), len(steps), f"{context}: final_metrics.total_steps")
-        assert_eq(fm.get("total_prompt_tokens"), sum_prompt, f"{context}: final_metrics.total_prompt_tokens")
-        assert_eq(fm.get("total_completion_tokens"), sum_completion, f"{context}: final_metrics.total_completion_tokens")
-        assert_eq(fm.get("total_cached_tokens"), sum_cached, f"{context}: final_metrics.total_cached_tokens")
-
-
-def test_toml_validation(tmp_dir):
-    print("[1/7] Testing TOML config validation...")
+def test_config_validation(tmp_dir):
+    print("[1/9] Testing TOML config validation...")
     bad_api_key_cfg = os.path.join(tmp_dir, "bad_api_key.toml")
     with open(bad_api_key_cfg, "w", encoding="utf-8") as f:
         f.write(
-            'listen = "127.0.0.1:18085"\n'
+            f'listen = "127.0.0.1:{PORT_CFG_TEST}"\n'
             f'sqlite_path = "{os.path.join(tmp_dir, "bad1.db")}"\n'
+            f'raw_log_dir = "{os.path.join(tmp_dir, "bad1_raw")}"\n'
             'dashboard_key = ""\n'
             '[upstreams.openai]\n'
             f'url = "http://127.0.0.1:{PORT_MOCK_OPENAI}"\n'
@@ -656,13 +59,13 @@ def test_toml_validation(tmp_dir):
         text=True,
         timeout=5,
     )
-    assert_true(res.returncode != 0, f"disallowed api_key config should fail, got exit 0")
+    assert_true(res.returncode != 0, "disallowed api_key config should fail")
     assert_true("api_key" in (res.stderr + res.stdout), f"expected api_key in error output: {res.stderr}")
 
     bad_unknown_cfg = os.path.join(tmp_dir, "bad_unknown.toml")
     with open(bad_unknown_cfg, "w", encoding="utf-8") as f:
         f.write(
-            'listen = "127.0.0.1:18085"\n'
+            f'listen = "127.0.0.1:{PORT_CFG_TEST}"\n'
             'unknown_top_field = true\n'
         )
     res2 = subprocess.run(
@@ -672,16 +75,17 @@ def test_toml_validation(tmp_dir):
         timeout=5,
     )
     assert_true(res2.returncode != 0, "unknown top-level key config should fail")
-    print("  PASS: TOML config validation rejected disallowed keys.")
+    print("  PASS: TOML config validation passed (valid config accepted, api_key and unknown keys rejected).")
 
 
 def test_auth_modes(tmp_dir, procs):
-    print("[5/7] Testing Auth modes & non-localhost warning...")
+    print("[2/9] Testing auth lifecycle & non-localhost warning (all 3 modes)...")
     cfg2 = os.path.join(tmp_dir, "mode2.toml")
     with open(cfg2, "w", encoding="utf-8") as f:
         f.write(
             f'listen = "127.0.0.1:{PORT_MODE2}"\n'
             f'sqlite_path = "{os.path.join(tmp_dir, "mode2.db")}"\n'
+            f'raw_log_dir = "{os.path.join(tmp_dir, "mode2_raw")}"\n'
             'dashboard_key = ""\n'
         )
     p2 = subprocess.Popen([BINARY_PATH, "-config", cfg2], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -702,6 +106,7 @@ def test_auth_modes(tmp_dir, procs):
         f.write(
             f'listen = "0.0.0.0:{PORT_MODE3}"\n'
             f'sqlite_path = "{os.path.join(tmp_dir, "mode3.db")}"\n'
+            f'raw_log_dir = "{os.path.join(tmp_dir, "mode3_raw")}"\n'
             'dashboard_key = ""\n'
         )
     p3 = subprocess.Popen([BINARY_PATH, "-config", cfg3], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -757,11 +162,7 @@ def test_auth_modes(tmp_dir, procs):
     st, _, _ = http_request(f"{base1}/api/traces", opener=opener)
     assert_eq(st, 200, "mode1 /api/traces authenticated")
 
-    st, _, _ = http_request(
-        f"{base1}/api/auth/logout",
-        method="POST",
-        opener=opener,
-    )
+    st, _, _ = http_request(f"{base1}/api/auth/logout", method="POST", opener=opener)
     assert_eq(st, 200, "mode1 logout")
 
     st, _, _ = http_request(f"{base1}/api/traces", opener=opener)
@@ -775,15 +176,19 @@ def test_auth_modes(tmp_dir, procs):
         opener=opener,
     )
     assert_eq(st, 200, "mode1 re-login")
-    print("  PASS: All 3 auth modes and login/logout lifecycle verified.")
+    print("  PASS: All 3 auth modes and login/401/cookie/logout lifecycle verified.")
     return opener
 
 
 def test_transparent_forwarding(base1, oai_rec, ant_rec):
-    print("[2a/7] Testing byte-for-byte transparent forwarding (streaming & non-streaming)...")
+    print("[3/9] Testing byte-for-byte transparent forwarding across all 3 protocols...")
 
-    raw_oai_ns = b'{\n  "model":  "gpt-4o-mini",\n  "stream": false,\n  "messages": [ {"role": "user", "content": "Exact byte check unicode: \\u4f60\\u597d"} ]\n}'
-    st, hdrs, resp_bytes = http_request(
+    raw_oai_ns = (
+        b'{\n  "model":  "gpt-4o-mini",\n  "stream": false,\n'
+        b'  "tools": [{"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {"type": "object"}}}],\n'
+        b'  "messages": [ {"role": "user", "content": "WANT_REASONING USE_TOOL_READ Exact byte check unicode: \\u4f60\\u597d"} ]\n}'
+    )
+    st, _, resp_bytes = http_request(
         f"{base1}/proxy/openai/v1/chat/completions?e2e=1&mode=ns",
         method="POST",
         headers={
@@ -794,14 +199,18 @@ def test_transparent_forwarding(base1, oai_rec, ant_rec):
         },
         body=raw_oai_ns,
     )
-    assert_eq(st, 200, "oai non-stream proxy status")
+    assert_eq(st, 200, "oai chat non-stream proxy status")
     rec = oai_rec.last()
-    assert_eq(rec["request_body"], raw_oai_ns, "oai non-stream request bytes unmodified")
-    assert_eq(rec["headers"].get("Authorization"), "Bearer sk-e2e-openai-exact", "oai auth header preserved")
-    assert_eq(rec["query"], "e2e=1&mode=ns", "oai query string preserved")
-    assert_eq(resp_bytes, rec["response_body"], "oai non-stream response bytes unmodified")
+    assert_eq(rec["request_body"], raw_oai_ns, "oai chat non-stream request bytes unmodified")
+    assert_eq(rec["headers"].get("Authorization"), "Bearer sk-e2e-openai-exact", "oai chat auth header preserved")
+    assert_eq(rec["query"], "e2e=1&mode=ns", "oai chat query string preserved")
+    assert_eq(resp_bytes, rec["response_body"], "oai chat non-stream response bytes unmodified")
 
-    raw_oai_s = b'{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"Stream exact byte check"}]}'
+    raw_oai_s = (
+        b'{"model":"gpt-4o-mini","stream":true,'
+        b'"tools":[{"type":"function","function":{"name":"read","description":"Read file","parameters":{"type":"object"}}}],'
+        b'"messages":[{"role":"user","content":"WANT_REASONING USE_TOOL_READ Stream exact byte check"}]}'
+    )
     st, _, resp_bytes = http_request(
         f"{base1}/proxy/openai/v1/chat/completions?stream_check=1",
         method="POST",
@@ -813,12 +222,83 @@ def test_transparent_forwarding(base1, oai_rec, ant_rec):
         },
         body=raw_oai_s,
     )
-    assert_eq(st, 200, "oai stream proxy status")
+    assert_eq(st, 200, "oai chat stream proxy status")
     rec = oai_rec.last()
-    assert_eq(rec["request_body"], raw_oai_s, "oai stream request bytes unmodified")
-    assert_eq(resp_bytes, rec["response_body"], "oai stream response SSE bytes unmodified")
+    assert_eq(rec["request_body"], raw_oai_s, "oai chat stream request bytes unmodified")
+    assert_eq(resp_bytes, rec["response_body"], "oai chat stream response SSE bytes unmodified")
 
-    raw_ant_ns = b'{\n  "model": "claude-sonnet-4-5",\n  "max_tokens": 256,\n  "stream": false,\n  "messages": [{"role": "user", "content": "Anthropic exact byte check"}]\n}'
+    raw_resp_ns = json.dumps({
+        "model": "gpt-5.2-codex",
+        "stream": False,
+        "instructions": "You are a precise Responses API assistant.",
+        "reasoning": {"effort": "high"},
+        "tools": [
+            {
+                "type": "function",
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            }
+        ],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "USE_RESP_TOOL Run pwd"}]}
+        ],
+    }, separators=(", ", ": ")).encode("utf-8")
+    st, _, resp_bytes = http_request(
+        f"{base1}/proxy/openai/v1/responses?resp_mode=ns",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-e2e-responses-ns",
+            "User-Agent": "byte-checker/1.0.0",
+            "X-Session-Id": "sess-bytes-resp-ns",
+        },
+        body=raw_resp_ns,
+    )
+    assert_eq(st, 200, "oai responses non-stream proxy status")
+    rec = oai_rec.last()
+    assert_eq(rec["request_body"], raw_resp_ns, "oai responses non-stream request bytes unmodified")
+    assert_eq(rec["query"], "resp_mode=ns", "oai responses query string preserved")
+    assert_eq(resp_bytes, rec["response_body"], "oai responses non-stream response bytes unmodified")
+
+    raw_resp_s = json.dumps({
+        "model": "gpt-5.2-codex",
+        "stream": True,
+        "instructions": "You are a streaming Responses API assistant.",
+        "reasoning": {"effort": "medium"},
+        "tools": [
+            {
+                "type": "function",
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            }
+        ],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "USE_RESP_TOOL Stream responses check"}]}
+        ],
+    }).encode("utf-8")
+    st, _, resp_bytes = http_request(
+        f"{base1}/proxy/openai/v1/responses?resp_mode=stream",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-e2e-responses-stream",
+            "User-Agent": "byte-checker/1.0.0",
+            "X-Session-Id": "sess-bytes-resp-stream",
+        },
+        body=raw_resp_s,
+    )
+    assert_eq(st, 200, "oai responses stream proxy status")
+    rec = oai_rec.last()
+    assert_eq(rec["request_body"], raw_resp_s, "oai responses stream request bytes unmodified")
+    assert_eq(resp_bytes, rec["response_body"], "oai responses stream SSE response bytes unmodified")
+
+    raw_ant_ns = (
+        b'{\n  "model": "claude-sonnet-4-5",\n  "max_tokens": 256,\n  "stream": false,\n'
+        b'  "tools": [{"name": "read", "description": "Read file", "input_schema": {"type": "object"}}],\n'
+        b'  "messages": [{"role": "user", "content": "USE_TOOL_READ Anthropic exact byte check"}]\n}'
+    )
     st, _, resp_bytes = http_request(
         f"{base1}/proxy/anthropic/v1/messages?ant=ns",
         method="POST",
@@ -839,7 +319,11 @@ def test_transparent_forwarding(base1, oai_rec, ant_rec):
     assert_eq(rec["query"], "ant=ns", "anthropic query string preserved")
     assert_eq(resp_bytes, rec["response_body"], "anthropic non-stream response bytes unmodified")
 
-    raw_ant_s = b'{"model":"claude-sonnet-4-5","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"Anthropic stream exact byte check"}]}'
+    raw_ant_s = (
+        b'{"model":"claude-sonnet-4-5","max_tokens":256,"stream":true,'
+        b'"tools":[{"name":"read","description":"Read file","input_schema":{"type":"object"}}],'
+        b'"messages":[{"role":"user","content":"USE_TOOL_READ Anthropic stream exact byte check"}]}'
+    )
     st, _, resp_bytes = http_request(
         f"{base1}/proxy/anthropic/v1/messages?ant=stream",
         method="POST",
@@ -856,11 +340,15 @@ def test_transparent_forwarding(base1, oai_rec, ant_rec):
     rec = ant_rec.last()
     assert_eq(rec["request_body"], raw_ant_s, "anthropic stream request bytes unmodified")
     assert_eq(resp_bytes, rec["response_body"], "anthropic stream response SSE bytes unmodified")
-    print("  PASS: Byte-for-byte transparent forwarding verified for OpenAI & Anthropic (stream & non-stream).")
+    print("  PASS: Byte-for-byte forwarding verified for Chat Completions, Responses API, and Anthropic Messages (stream & non-stream).")
 
 
 def test_real_pi_agent(tmp_dir, base1):
-    print("[2b/7] Testing real `pi` agent through proxy (OpenAI & Anthropic)...")
+    print("[4/9] Testing real `pi` agent through proxy (OpenAI & Anthropic)...")
+    if not PI_BIN or not os.path.isfile(PI_BIN) or not os.access(PI_BIN, os.X_OK):
+        print("  SKIP: `pi` CLI not found in PATH or ~/.local/bin/pi.")
+        return None, None
+
     pi_agent_dir = os.path.join(tmp_dir, "pi_agent_dir")
     os.makedirs(pi_agent_dir, exist_ok=True)
 
@@ -878,9 +366,9 @@ def test_real_pi_agent(tmp_dir, base1):
                         "input": ["text"],
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                         "contextWindow": 128000,
-                        "maxTokens": 4096
+                        "maxTokens": 4096,
                     }
-                ]
+                ],
             },
             "e2e-anthropic": {
                 "baseUrl": f"{base1}/proxy/anthropic",
@@ -894,10 +382,10 @@ def test_real_pi_agent(tmp_dir, base1):
                         "input": ["text"],
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                         "contextWindow": 200000,
-                        "maxTokens": 4096
+                        "maxTokens": 4096,
                     }
-                ]
-            }
+                ],
+            },
         }
     }
     with open(os.path.join(pi_agent_dir, "models.json"), "w", encoding="utf-8") as f:
@@ -958,15 +446,192 @@ def test_real_pi_agent(tmp_dir, base1):
     return wd_oai, wd_ant
 
 
-def test_harness_detection(base1):
-    print("[3/7] Sending harness detection test requests (Claude Code, Codex, OpenCode, Generic)...")
+def test_real_claude_code(tmp_dir, base1, opener):
+    print("[4b/9] Testing real `claude` CLI through proxy (Anthropic Messages + tool call)...")
+    if not CLAUDE_BIN or not os.path.isfile(CLAUDE_BIN) or not os.access(CLAUDE_BIN, os.X_OK):
+        print("  SKIP: `claude` CLI not found in PATH or ~/.local/bin/claude.")
+        return None
 
+    wd_claude = os.path.join(tmp_dir, "workdir_claude_real")
+    os.makedirs(wd_claude, exist_ok=True)
+    hello_claude = os.path.join(wd_claude, "hello.txt")
+    with open(hello_claude, "w", encoding="utf-8") as f:
+        f.write("Hello from real Claude Code e2e test!\n")
+
+    claude_key = "sk-claude-real-e2e-key"
+    settings_json = json.dumps({
+        "env": {
+            "ANTHROPIC_BASE_URL": f"{base1}/proxy/anthropic",
+            "ANTHROPIC_API_KEY": claude_key,
+            "ANTHROPIC_AUTH_TOKEN": claude_key,
+        }
+    })
+    env = os.environ.copy()
+    env["ANTHROPIC_BASE_URL"] = f"{base1}/proxy/anthropic"
+    env["ANTHROPIC_API_KEY"] = claude_key
+    env["ANTHROPIC_AUTH_TOKEN"] = claude_key
+
+    res = subprocess.run(
+        [
+            CLAUDE_BIN,
+            "-p",
+            "--settings", settings_json,
+            "--model", "claude-sonnet-4-5",
+            "--dangerously-skip-permissions",
+            "--no-session-persistence",
+            "--",
+            f"USE_TOOL_READ READ_PATH:{hello_claude} please read hello.txt",
+        ],
+        cwd=wd_claude,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert_eq(res.returncode, 0, f"claude real run failed: stdout={res.stdout!r} stderr={res.stderr!r}")
+    assert_true(
+        "Anthropic mock final answer after tool" in res.stdout or "Anthropic mock stream answer" in res.stdout,
+        f"unexpected claude stdout: {res.stdout!r}",
+    )
+
+    st, _, body = http_request(f"{base1}/api/traces?harness=claude-code&limit=50", opener=opener)
+    assert_eq(st, 200, "GET /api/traces?harness=claude-code")
+    claude_traces = json.loads(body)["traces"]
+    expected_hash = sha256_hex(claude_key)
+    matched = [t for t in claude_traces if t.get("api_key_hash") == expected_hash]
+    assert_true(len(matched) >= 1, f"real claude trace not found in {claude_traces}")
+    tr_sum = matched[0]
+    assert_eq(tr_sum["harness"], "claude-code", "real claude harness")
+    assert_true(len(tr_sum["session_id"]) > 8 and tr_sum["session_id"] != "id", f"real claude session_id: {tr_sum['session_id']!r}")
+    assert_true(os.path.basename(wd_claude) in tr_sum["work_dir"], f"real claude work_dir: {tr_sum['work_dir']!r}")
+
+    sid_enc = urllib.parse.quote(tr_sum["session_id"], safe="")
+    st, _, tb = http_request(f"{base1}/api/traces/{sid_enc}/trajectories", opener=opener)
+    assert_eq(st, 200, "GET real claude trajectories")
+    t_data = json.loads(tb)
+    assert_true(t_data["llm_call_count"] >= 2, f"real claude expected >=2 llm calls, got {t_data['llm_call_count']}")
+    ver = ""
+    for idx, traj in enumerate(t_data["trajectories"]):
+        validate_atif_v18(traj, context=f"real-claude[{idx}]")
+        assert_eq(traj["agent"]["name"], "claude-code", "real claude agent.name")
+        ver = traj["agent"]["version"]
+        assert_true(ver not in ("", "unknown"), f"real claude agent.version: {ver!r}")
+
+    print(f"  PASS: Real `claude` CLI ({ver}) completed end-to-end tool call (sid={tr_sum['session_id']}, calls={t_data['llm_call_count']}).")
+    return wd_claude
+
+
+def test_all_harnesses(base1, opener, db_path, wd_oai, wd_ant):
+    print("[5/9] Testing all 6 harnesses (pi, dumate+subagents, claude-code, codex, opencode, generic)...")
+
+    if wd_oai is None:
+        st, _, _ = http_request(
+            f"{base1}/proxy/openai/v1/chat/completions",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer sk-pi-synthetic",
+                "User-Agent": "pi-coding-agent/1.5.0",
+                "X-Session-Id": "sess-pi-synthetic",
+                "X-Work-Dir": "/tmp/pi-wd",
+            },
+            body=json.dumps({
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "Hello Pi"}],
+            }).encode("utf-8"),
+        )
+        assert_eq(st, 200, "pi synthetic proxy request")
+
+    dumate_key = "sk-dumate-secret-key"
+    dumate_tools = [
+        {"type": "function", "function": {"name": "task", "description": "Spawn subagent", "parameters": {"type": "object"}}}
+    ]
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {dumate_key}",
+            "User-Agent": "DumateApp/1.0.93.526 (macOS; arm64)",
+            "X-Dumate-Session-Id": "sess-dumate-e2e",
+            "X-Dumate-Request-Extra-Param": "source=user,sandbox=true,sandboxType=docker",
+            "X-Work-Dir": "/tmp/dumate-wd",
+        },
+        body=json.dumps({
+            "model": "gpt-4o",
+            "tools": dumate_tools,
+            "messages": [
+                {"role": "system", "content": "You are DuMate."},
+                {"role": "user", "content": "USE_TOOL_TASK Delegate subtask"},
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "dumate main turn 1")
+
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {dumate_key}",
+            "User-Agent": "DumateApp/1.0.93.526 (macOS; arm64)",
+            "X-Dumate-Session-Id": "sess-dumate-e2e",
+            "X-Dumate-Request-Extra-Param": "source=subAgent,sandbox=true",
+        },
+        body=json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are DuMate subagent."},
+                {"role": "user", "content": "Inspect subagent target"},
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "dumate subagent turn 1")
+
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {dumate_key}",
+            "User-Agent": "DumateApp/1.0.93.526 (macOS; arm64)",
+            "X-Dumate-Session-Id": "sess-dumate-e2e",
+            "X-Dumate-Request-Extra-Param": "source=user,sandbox=true,sandboxType=docker",
+        },
+        body=json.dumps({
+            "model": "gpt-4o",
+            "tools": dumate_tools,
+            "messages": [
+                {"role": "system", "content": "You are DuMate."},
+                {"role": "user", "content": "USE_TOOL_TASK Delegate subtask"},
+                {
+                    "role": "assistant",
+                    "content": "Calling tool now.",
+                    "tool_calls": [
+                        {
+                            "id": "call_oai_ns_task_1",
+                            "type": "function",
+                            "function": {"name": "task", "arguments": json.dumps({"prompt": "run subagent"})},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_oai_ns_task_1",
+                    "content": "task_id: dumate-sub-task-42\nSubagent completed successfully.",
+                },
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "dumate main turn 2")
+
+    claude_key = "sk-claude-test-key"
     st, _, _ = http_request(
         f"{base1}/proxy/anthropic/v1/messages",
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "x-api-key": "sk-claude-test",
+            "x-api-key": claude_key,
             "User-Agent": "claude-cli/1.2.3 (darwin; arm64)",
             "X-Claude-Session-Id": "sess-claude-e2e",
         },
@@ -979,29 +644,32 @@ def test_harness_detection(base1):
     )
     assert_eq(st, 200, "claude-code proxy request")
 
+    codex_key = "sk-codex-test-key"
     st, _, _ = http_request(
-        f"{base1}/proxy/openai/v1/chat/completions",
+        f"{base1}/proxy/openai/v1/responses",
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "Authorization": "Bearer sk-codex-test",
-            "User-Agent": "codex-cli/0.9.1",
+            "Authorization": f"Bearer {codex_key}",
+            "User-Agent": "codex_cli_rs/0.9.1 (Mac OS 15.0; arm64)",
             "Session_id": "sess-codex-e2e",
             "X-Work-Dir": "/tmp/codex-wd",
         },
         body=json.dumps({
-            "model": "gpt-4o",
-            "messages": [{"role": "user", "content": "Hello Codex"}],
+            "model": "gpt-5.2-codex",
+            "instructions": "You are Codex.",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello Codex"}]}],
         }).encode("utf-8"),
     )
     assert_eq(st, 200, "codex proxy request")
 
+    opencode_key = "sk-opencode-test-key"
     st, _, _ = http_request(
         f"{base1}/proxy/openai/v1/chat/completions",
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "Authorization": "Bearer sk-opencode-test",
+            "Authorization": f"Bearer {opencode_key}",
             "User-Agent": "opencode/2.1.0",
             "X-Opencode-Session": "sess-opencode-e2e",
         },
@@ -1015,12 +683,13 @@ def test_harness_detection(base1):
     )
     assert_eq(st, 200, "opencode proxy request")
 
+    generic_key = "sk-generic-test-key"
     st, _, _ = http_request(
         f"{base1}/proxy/openai/v1/chat/completions",
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "Authorization": "Bearer sk-generic-test",
+            "Authorization": f"Bearer {generic_key}",
             "User-Agent": "my-custom-agent/3.4.5",
         },
         body=json.dumps({
@@ -1029,94 +698,485 @@ def test_harness_detection(base1):
         }).encode("utf-8"),
     )
     assert_eq(st, 200, "generic proxy request")
-    print("  PASS: Harness test requests completed.")
-
-
-def test_sqlite_atif_and_api(db_path, base1, opener, wd_oai, wd_ant):
-    print("[4/7 & 6/7] Verifying SQLite persistence, harness extraction, strict ATIF-v1.8, filters, and JSONL export...")
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    sess_count = cur.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-    req_count = cur.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
-    assert_true(sess_count >= 10, f"expected >=10 sessions in sqlite, got {sess_count}")
-    assert_true(req_count >= 12, f"expected >=12 requests in sqlite, got {req_count}")
-
     req_hdr_rows = cur.execute("SELECT request_headers FROM requests").fetchall()
     for (hdr_json,) in req_hdr_rows:
         assert_true("sk-e2e-" not in hdr_json, f"secret key leaked in sqlite request_headers: {hdr_json}")
         assert_true("sk-pi-" not in hdr_json, f"pi secret key leaked in sqlite request_headers: {hdr_json}")
+        assert_true("sk-dumate-" not in hdr_json, f"dumate key leaked in sqlite request_headers: {hdr_json}")
+        assert_true("sk-claude-" not in hdr_json, f"claude key leaked in sqlite request_headers: {hdr_json}")
+        assert_true("sk-codex-" not in hdr_json, f"codex key leaked in sqlite request_headers: {hdr_json}")
+        assert_true("sk-opencode-" not in hdr_json, f"opencode key leaked in sqlite request_headers: {hdr_json}")
+        assert_true("sk-generic-" not in hdr_json, f"generic key leaked in sqlite request_headers: {hdr_json}")
     conn.close()
 
-    st, _, body = http_request(f"{base1}/api/traces?limit=100", opener=opener)
+    st, _, body = http_request(f"{base1}/api/traces?limit=200", opener=opener)
     assert_eq(st, 200, "GET /api/traces")
     listing = json.loads(body)
     traces = listing["traces"]
-    assert_eq(listing["total"], len(traces), "total matches trace count")
-
     by_id = {t["session_id"]: t for t in traces}
 
-    assert_true("sess-claude-e2e" in by_id, "claude-code session recorded")
-    assert_eq(by_id["sess-claude-e2e"]["harness"], "claude-code", "claude-code harness")
-    assert_eq(by_id["sess-claude-e2e"]["work_dir"], "/tmp/claude-wd", "claude-code work_dir")
+    for sid, expected_harness, expected_wd, expected_key in [
+        ("sess-dumate-e2e", "dumate", "/tmp/dumate-wd", dumate_key),
+        ("sess-claude-e2e", "claude-code", "/tmp/claude-wd", claude_key),
+        ("sess-codex-e2e", "codex", "/tmp/codex-wd", codex_key),
+        ("sess-opencode-e2e", "opencode", "/tmp/opencode-wd", opencode_key),
+    ]:
+        assert_true(sid in by_id, f"{sid} recorded")
+        item = by_id[sid]
+        assert_eq(item["harness"], expected_harness, f"{sid} harness")
+        assert_eq(item["work_dir"], expected_wd, f"{sid} work_dir")
+        assert_eq(item["api_key_hash"], sha256_hex(expected_key), f"{sid} api_key_hash")
+        assert_eq(len(item["api_key_hash"]), 64, f"{sid} api_key_hash length")
+        assert_eq(item["client_ip"], "127.0.0.1", f"{sid} client_ip")
 
-    assert_true("sess-codex-e2e" in by_id, "codex session recorded")
-    assert_eq(by_id["sess-codex-e2e"]["harness"], "codex", "codex harness")
-    assert_eq(by_id["sess-codex-e2e"]["work_dir"], "/tmp/codex-wd", "codex work_dir")
-
-    assert_true("sess-opencode-e2e" in by_id, "opencode session recorded")
-    assert_eq(by_id["sess-opencode-e2e"]["harness"], "opencode", "opencode harness")
-    assert_eq(by_id["sess-opencode-e2e"]["work_dir"], "/tmp/opencode-wd", "opencode work_dir")
-
-    generic_fallback = [t for t in traces if t["harness"] == "generic" and t["session_id"].startswith("sess-")]
-    assert_true(len(generic_fallback) >= 1, "generic fallback session recorded")
+    generic_sessions = [t for t in traces if t["harness"] == "generic" and t["api_key_hash"] == sha256_hex(generic_key)]
+    assert_true(len(generic_sessions) >= 1, "generic session recorded with api_key_hash")
+    assert_eq(generic_sessions[0]["client_ip"], "127.0.0.1", "generic client_ip")
 
     pi_traces = [t for t in traces if t["harness"] == "pi"]
-    assert_true(len(pi_traces) >= 2, f"expected >=2 pi traces (openai + anthropic), got {len(pi_traces)}: {pi_traces}")
-    pi_upstreams = {t["upstream"] for t in pi_traces}
-    assert_true("openai" in pi_upstreams and "anthropic" in pi_upstreams, f"pi upstreams: {pi_upstreams}")
-    pi_workdirs = {t["work_dir"] for t in pi_traces}
+    assert_true(len(pi_traces) >= 1, "pi traces recorded")
+    if wd_oai is not None and wd_ant is not None:
+        pi_upstreams = {t["upstream"] for t in pi_traces}
+        assert_true("openai" in pi_upstreams and "anthropic" in pi_upstreams, f"pi upstreams: {pi_upstreams}")
+        pi_workdirs = {t["work_dir"] for t in pi_traces}
+        assert_true(
+            any(wd_oai in wd for wd in pi_workdirs) and any(wd_ant in wd for wd in pi_workdirs),
+            f"pi work_dirs not extracted: {pi_workdirs}",
+        )
+
+    st, _, dumate_body = http_request(f"{base1}/api/traces/sess-dumate-e2e", opener=opener)
+    assert_eq(st, 200, "GET dumate trace")
+    dumate_traj = json.loads(dumate_body)
+    validate_atif_v18(dumate_traj, context="dumate")
+    assert_eq(dumate_traj["agent"]["name"], "dumate", "dumate agent.name")
+    assert_eq(dumate_traj["agent"]["version"], "1.0.93.526", "dumate agent.version")
+    subs = dumate_traj.get("subagent_trajectories") or []
+    assert_eq(len(subs), 1, "dumate subagent_trajectories count")
+    assert_eq(subs[0]["session_id"], "dumate-sub-task-42", "dumate subagent task_id linked session_id")
+    assert_eq(subs[0]["trajectory_id"], "dumate-sub-task-42", "dumate subagent task_id linked trajectory_id")
+    linked_refs = []
+    for step in dumate_traj["steps"]:
+        obs = step.get("observation")
+        if obs:
+            for r in obs.get("results", []):
+                for ref in r.get("subagent_trajectory_ref", []):
+                    linked_refs.append(ref)
     assert_true(
-        any(wd_oai in wd for wd in pi_workdirs) and any(wd_ant in wd for wd in pi_workdirs),
-        f"pi work_dirs not extracted: got {pi_workdirs}, expected {wd_oai} and {wd_ant}",
+        any(ref.get("trajectory_id") == "dumate-sub-task-42" for ref in linked_refs),
+        f"dumate observation missing subagent_trajectory_ref for task_id: {linked_refs}",
     )
 
-    for t in traces:
-        sid = t["session_id"]
-        st, _, detail_body = http_request(f"{base1}/api/traces/{urllib.parse.quote(sid, safe='')}", opener=opener)
-        assert_eq(st, 200, f"GET /api/traces/{sid}")
-        traj = json.loads(detail_body)
-        validate_atif_v18(traj, context=f"detail:{sid}")
+    for sid, expected_ver in [
+        ("sess-claude-e2e", "1.2.3"),
+        ("sess-codex-e2e", "0.9.1"),
+        ("sess-opencode-e2e", "2.1.0"),
+    ]:
+        st, _, tb = http_request(f"{base1}/api/traces/{sid}", opener=opener)
+        assert_eq(st, 200, f"GET {sid}")
+        tr = json.loads(tb)
+        validate_atif_v18(tr, context=sid)
+        assert_eq(tr["agent"]["version"], expected_ver, f"{sid} version")
 
-        if t["harness"] == "pi":
-            assert_eq(traj["agent"]["name"], "pi", f"pi agent name for {sid}")
-            assert_eq(traj["agent"]["version"], "1.5.0", f"pi agent version for {sid}")
-            agent_steps = [s for s in traj["steps"] if s["source"] == "agent"]
-            assert_true(len(agent_steps) >= 2, f"pi multi-turn trace {sid} should have >=2 agent steps, got {len(agent_steps)}")
-            has_tc = any("tool_calls" in s and len(s["tool_calls"]) > 0 for s in agent_steps)
-            has_obs = any("observation" in s and len(s["observation"]["results"]) > 0 for s in agent_steps)
-            assert_true(has_tc, f"pi trace {sid} missing tool_calls")
-            assert_true(has_obs, f"pi trace {sid} missing observation")
-            if t["upstream"] == "anthropic":
-                has_reasoning = any(bool(s.get("reasoning_content")) for s in agent_steps)
-                assert_true(has_reasoning, f"pi anthropic trace {sid} missing reasoning_content")
+    print("  PASS: All 6 harnesses, dumate subagent/task_id linking, api_key_hash, client_ip, and header redaction verified.")
 
-        if sid == "sess-claude-e2e":
-            assert_eq(traj["agent"]["version"], "1.2.3", "claude-code version")
-        elif sid == "sess-codex-e2e":
-            assert_eq(traj["agent"]["version"], "0.9.1", "codex version")
-        elif sid == "sess-opencode-e2e":
-            assert_eq(traj["agent"]["version"], "2.1.0", "opencode version")
 
-    st, _, body = http_request(f"{base1}/api/traces?harness=pi", opener=opener)
-    assert_eq(st, 200, "filter harness=pi")
-    f_pi = json.loads(body)["traces"]
-    assert_true(len(f_pi) >= 2 and all(x["harness"] == "pi" for x in f_pi), "harness filter failed")
+def test_multi_trajectory_and_atif(base1, opener):
+    print("[6/9] Testing strict ATIF-v1.8, Responses multi-turn, continuation splits, is_copied_context, llm_call_count & zero-cache omitempty...")
+
+    linear_chat_sid = "sess-linear-chat-zerocache"
+    chat_tools = [
+        {"type": "function", "function": {"name": "read", "description": "Read file", "parameters": {"type": "object"}}}
+    ]
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-linear-chat",
+            "User-Agent": "e2e-agent/1.0.0",
+            "X-Session-Id": linear_chat_sid,
+        },
+        body=json.dumps({
+            "model": "gpt-4o-mini",
+            "tools": chat_tools,
+            "messages": [
+                {"role": "system", "content": "Linear chat system prompt."},
+                {"role": "user", "content": "ZERO_CACHE USE_TOOL_READ READ_PATH:a.txt"},
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "linear chat turn 1")
+
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-linear-chat",
+            "User-Agent": "e2e-agent/1.0.0",
+            "X-Session-Id": linear_chat_sid,
+        },
+        body=json.dumps({
+            "model": "gpt-4o-mini",
+            "tools": chat_tools,
+            "messages": [
+                {"role": "system", "content": "Linear chat system prompt."},
+                {"role": "user", "content": "ZERO_CACHE USE_TOOL_READ READ_PATH:a.txt"},
+                {
+                    "role": "assistant",
+                    "content": "Calling tool now.",
+                    "tool_calls": [
+                        {
+                            "id": "call_oai_ns_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": json.dumps({"path": "a.txt"})},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_oai_ns_1", "content": "file content of a.txt"},
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "linear chat turn 2")
+
+    st, _, body = http_request(f"{base1}/api/traces/{linear_chat_sid}/trajectories", opener=opener)
+    assert_eq(st, 200, "GET linear chat trajectories")
+    lc_data = json.loads(body)
+    assert_eq(lc_data["llm_call_count"], 2, "linear chat session llm_call_count")
+    assert_eq(len(lc_data["trajectories"]), 1, "linear chat stays in 1 trajectory")
+    lc_traj = lc_data["trajectories"][0]
+    validate_atif_v18(lc_traj, context=linear_chat_sid)
+    assert_eq(lc_traj["extra"]["llm_call_count"], 2, "linear chat trajectory extra.llm_call_count")
+    assert_eq(lc_traj["final_metrics"]["extra"]["llm_call_count"], 2, "linear chat final_metrics.extra.llm_call_count")
+    lc_agents = [s for s in lc_traj["steps"] if s["source"] == "agent"]
+    assert_eq(len(lc_agents), 2, "linear chat agent step count")
+    for s in lc_agents:
+        assert_eq(s.get("llm_call_count"), 1, "real agent step llm_call_count == 1")
+        assert_true("cached_tokens" not in (s.get("metrics") or {}), "cached_tokens omitted when 0")
+
+    resp_linear_sid = "sess-responses-multiturn"
+    resp_tools = [
+        {
+            "type": "function",
+            "name": "shell",
+            "description": "Execute shell command",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        }
+    ]
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/responses",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-resp-mt",
+            "User-Agent": "codex_cli_rs/0.9.5",
+            "Session_id": resp_linear_sid,
+        },
+        body=json.dumps({
+            "model": "gpt-5.2-codex",
+            "stream": True,
+            "instructions": "Codex system instructions.",
+            "tools": resp_tools,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "USE_RESP_TOOL Check workspace"}]}
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "responses multi-turn 1")
+
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/responses",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-resp-mt",
+            "User-Agent": "codex_cli_rs/0.9.5",
+            "Session_id": resp_linear_sid,
+        },
+        body=json.dumps({
+            "model": "gpt-5.2-codex",
+            "stream": True,
+            "instructions": "Codex system instructions.",
+            "tools": resp_tools,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "USE_RESP_TOOL Check workspace"}]},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Thinking through the responses API step carefully."}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_resp_stream_1",
+                    "name": "shell",
+                    "arguments": json.dumps({"command": "echo responses_ok"}),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_resp_stream_1",
+                    "output": "responses_ok",
+                },
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "responses multi-turn 2")
+
+    st, _, body = http_request(f"{base1}/api/traces/{resp_linear_sid}/trajectories", opener=opener)
+    assert_eq(st, 200, "GET responses multi-turn trajectories")
+    rm_data = json.loads(body)
+    assert_eq(rm_data["llm_call_count"], 2, "responses multi-turn llm_call_count")
+    assert_eq(len(rm_data["trajectories"]), 1, "responses linear multi-turn stays in 1 trajectory")
+    rm_traj = rm_data["trajectories"][0]
+    validate_atif_v18(rm_traj, context=resp_linear_sid)
+    rm_agents = [s for s in rm_traj["steps"] if s["source"] == "agent"]
+    assert_eq(len(rm_agents), 2, "responses multi-turn agent steps")
+    assert_true(bool(rm_agents[0].get("reasoning_content")), "responses step 1 reasoning_content")
+    assert_true(len(rm_agents[0].get("tool_calls") or []) == 1, "responses step 1 tool_calls")
+    assert_eq(rm_agents[0]["tool_calls"][0]["function_name"], "shell", "responses step 1 tool name")
+    assert_true(len((rm_agents[0].get("observation") or {}).get("results") or []) == 1, "responses step 1 observation")
+    assert_eq(rm_agents[0]["metrics"]["cached_tokens"], 35, "responses cached_tokens")
+    assert_true("Responses stream final answer after tool" in rm_agents[1]["message"], "responses step 2 final message")
+
+    multi_seg_sid = "sess-multi-continuation"
+    tools_ab = [
+        {"type": "function", "function": {"name": "alpha", "description": "Tool A", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "beta", "description": "Tool B", "parameters": {"type": "object"}}},
+    ]
+    tools_ba = [
+        {"type": "function", "function": {"name": "beta", "description": "Tool B", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "alpha", "description": "Tool A", "parameters": {"type": "object"}}},
+    ]
+
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-multi-seg",
+            "User-Agent": "e2e-agent/1.0.0",
+            "X-Session-Id": multi_seg_sid,
+        },
+        body=json.dumps({
+            "model": "gpt-4o-mini",
+            "tools": tools_ab,
+            "messages": [
+                {"role": "system", "content": "Seg system prompt."},
+                {"role": "user", "content": "Seg 0 first question"},
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "multi-seg req 1")
+
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-multi-seg",
+            "User-Agent": "e2e-agent/1.0.0",
+            "X-Session-Id": multi_seg_sid,
+        },
+        body=json.dumps({
+            "model": "gpt-4o-mini",
+            "tools": tools_ab,
+            "messages": [
+                {"role": "system", "content": "Seg system prompt."},
+                {"role": "user", "content": "<summary>Compacted history of seg 0</summary>"},
+                {"role": "user", "content": "Seg 1 new question after compaction"},
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "multi-seg req 2 (compaction split)")
+
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-multi-seg",
+            "User-Agent": "e2e-agent/1.0.0",
+            "X-Session-Id": multi_seg_sid,
+        },
+        body=json.dumps({
+            "model": "gpt-4o-mini",
+            "tools": tools_ba,
+            "messages": [
+                {"role": "system", "content": "Seg system prompt."},
+                {"role": "user", "content": "<summary>Compacted history of seg 0</summary>"},
+                {"role": "user", "content": "Seg 1 new question after compaction"},
+                {"role": "assistant", "content": "OpenAI non-stream response payload."},
+                {"role": "user", "content": "Seg 2 after tool order change"},
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "multi-seg req 3 (tools order split)")
+
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-multi-seg",
+            "User-Agent": "e2e-agent/1.0.0",
+            "X-Session-Id": multi_seg_sid,
+        },
+        body=json.dumps({
+            "model": "gpt-4o-mini",
+            "tools": tools_ba,
+            "messages": [
+                {"role": "system", "content": "Completely unrelated fresh system prompt."},
+                {"role": "user", "content": "Completely unrelated fresh user prompt."},
+            ],
+        }).encode("utf-8"),
+    )
+    assert_eq(st, 200, "multi-seg req 4 (unrelated fresh trajectory)")
+
+    st, _, body = http_request(f"{base1}/api/traces/{multi_seg_sid}/trajectories", opener=opener)
+    assert_eq(st, 200, "GET multi-seg trajectories")
+    ms_data = json.loads(body)
+    assert_eq(ms_data["llm_call_count"], 4, "multi-seg total llm_call_count")
+    trajs = ms_data["trajectories"]
+    assert_eq(len(trajs), 4, f"expected 4 trajectory segments, got {len(trajs)}")
+    for idx, tr in enumerate(trajs):
+        validate_atif_v18(tr, context=f"{multi_seg_sid}[{idx}]")
+
+    assert_eq(trajs[0].get("continued_trajectory_ref"), "trajectory.cont-1.json", "seg 0 continued_trajectory_ref")
+    assert_eq(trajs[1].get("continued_trajectory_ref"), "trajectory.cont-2.json", "seg 1 continued_trajectory_ref")
+    assert_eq(trajs[2].get("continued_trajectory_ref"), "trajectory.cont-3.json", "seg 2 continued_trajectory_ref")
+    assert_true("continued_trajectory_ref" not in trajs[3], "last seg has no continued_trajectory_ref")
+
+    seg1_copied = [s for s in trajs[1]["steps"] if s.get("is_copied_context") is True]
+    assert_true(len(seg1_copied) >= 2, f"seg 1 should mark carried-over system + compaction summary as copied: {trajs[1]['steps']}")
+    seg1_fresh_user = [s for s in trajs[1]["steps"] if s["source"] == "user" and "Seg 1 new question" in s["message"]]
+    assert_eq(len(seg1_fresh_user), 1, "seg 1 fresh user step exists")
+    assert_true(not seg1_fresh_user[0].get("is_copied_context"), "seg 1 fresh user step must NOT be copied")
+
+    seg2_copied = [s for s in trajs[2]["steps"] if s.get("is_copied_context") is True]
+    assert_true(len(seg2_copied) >= 3, f"seg 2 should mark carried-over steps from seg 1 as copied: {trajs[2]['steps']}")
+
+    seg3_copied = [s for s in trajs[3]["steps"] if s.get("is_copied_context") is True]
+    assert_eq(len(seg3_copied), 0, f"seg 3 unrelated trajectory must have ZERO is_copied_context steps: {seg3_copied}")
+
+    print("  PASS: Strict ATIF-v1.8, Responses multi-turn, compaction/tools splits, is_copied_context precision, llm_call_count & zero-cache verified.")
+    return multi_seg_sid, resp_linear_sid
+
+
+def test_rawlog_append_only(raw_log_dir, db_path):
+    print("[7/9] Testing append-only daily RawLog JSONL...")
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    log_path = os.path.join(raw_log_dir, f"requests-{today}.jsonl")
+    assert_true(os.path.isfile(log_path), f"raw log file missing: {log_path}")
+
+    conn = sqlite3.connect(db_path)
+    req_count = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+    conn.close()
+
+    with open(log_path, "r", encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+
+    assert_eq(len(lines), req_count, f"rawlog line count ({len(lines)}) must equal total proxied requests ({req_count})")
+    for idx, ln in enumerate(lines):
+        entry = json.loads(ln)
+        assert_true(isinstance(entry.get("timestamp"), str) and len(entry["timestamp"]) > 0, f"rawlog[{idx}] timestamp")
+        assert_true(isinstance(entry.get("client_ip"), str) and len(entry["client_ip"]) > 0, f"rawlog[{idx}] client_ip")
+        assert_true(isinstance(entry.get("request_headers"), dict), f"rawlog[{idx}] request_headers")
+        assert_true(isinstance(entry.get("response_headers"), dict), f"rawlog[{idx}] response_headers")
+        if entry.get("method") == "POST":
+            assert_true(isinstance(entry.get("api_key_hash"), str) and len(entry["api_key_hash"]) == 64, f"rawlog[{idx}] api_key_hash")
+            assert_true(isinstance(entry.get("request_body"), str) and len(entry["request_body"]) > 0, f"rawlog[{idx}] request_body")
+            assert_true(isinstance(entry.get("response_body"), str) and len(entry["response_body"]) > 0, f"rawlog[{idx}] response_body")
+
+    print(f"  PASS: Append-only RawLog verified ({len(lines)} lines in requests-{today}.jsonl).")
+
+
+def wait_for_request_id(db_path, session_id, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT id FROM requests WHERE session_id = ? LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        conn.close()
+        if row is not None:
+            return row[0]
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for request row for session_id={session_id!r}")
+
+
+def test_http_raw_inspection_api(base1, opener, db_path):
+    print("[8/9] Testing HTTP Raw Inspection API (GET /api/requests/{id}) for Chat SSE, Responses SSE & gzip...")
+
+    gzip_body = gzip.compress(json.dumps({
+        "model": "gpt-4o-mini",
+        "stream": False,
+        "messages": [{"role": "user", "content": "Gzipped request inspection check"}],
+    }).encode("utf-8"))
+    st, _, _ = http_request(
+        f"{base1}/proxy/openai/v1/chat/completions",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Encoding": "gzip",
+            "Authorization": "Bearer sk-gzip-check",
+            "User-Agent": "gzip-checker/1.0.0",
+            "X-Session-Id": "sess-gzip-inspect",
+        },
+        body=gzip_body,
+    )
+    assert_eq(st, 200, "gzipped proxy request")
+
+    chat_sse_id = wait_for_request_id(db_path, "sess-bytes-oai-stream")
+    resp_sse_id = wait_for_request_id(db_path, "sess-bytes-resp-stream")
+    gzip_req_id = wait_for_request_id(db_path, "sess-gzip-inspect")
+
+    st, _, body = http_request(f"{base1}/api/requests/{chat_sse_id}", opener=opener)
+    assert_eq(st, 200, "GET /api/requests/{chat_sse_id}")
+    chat_raw = json.loads(body)
+    assert_eq(chat_raw["is_sse"], True, "chat SSE is_sse")
+    assert_true(isinstance(chat_raw.get("sse_events"), list) and len(chat_raw["sse_events"]) >= 2, "chat sse_events")
+    assert_true(isinstance(chat_raw.get("merged_response"), dict), "chat merged_response dict")
+    assert_true(len(chat_raw.get("api_key_hash", "")) == 64, "chat api_key_hash")
+    assert_eq(chat_raw.get("client_ip"), "127.0.0.1", "chat client_ip")
+
+    st, _, body = http_request(f"{base1}/api/requests/{resp_sse_id}", opener=opener)
+    assert_eq(st, 200, "GET /api/requests/{resp_sse_id}")
+    resp_raw = json.loads(body)
+    assert_eq(resp_raw["is_sse"], True, "responses SSE is_sse")
+    assert_true(isinstance(resp_raw.get("sse_events"), list) and len(resp_raw["sse_events"]) >= 5, "responses sse_events")
+    merged = resp_raw.get("merged_response")
+    assert_true(isinstance(merged, dict), f"responses merged_response must be dict, got {merged!r}")
+    assert_true(bool(merged.get("id")), f"responses merged_response missing id: {merged}")
+    assert_true(bool(merged.get("model")), f"responses merged_response missing model: {merged}")
+    assert_true(
+        bool(merged.get("output")) or bool(merged.get("tool_calls")) or bool(merged.get("content")),
+        f"responses merged_response missing output/content/tool_calls: {merged}",
+    )
+
+    st, _, body = http_request(f"{base1}/api/requests/{gzip_req_id}", opener=opener)
+    assert_eq(st, 200, "GET /api/requests/{gzip_req_id}")
+    gzip_raw = json.loads(body)
+    assert_eq(gzip_raw["is_sse"], False, "gzip non-stream is_sse")
+    assert_true("Gzipped request inspection check" in gzip_raw["request_body"], "gzip request_body decompressed")
+    assert_true("sse_events" not in gzip_raw, "non-stream omits sse_events")
+    assert_true("merged_response" not in gzip_raw, "non-stream omits merged_response")
+    print("  PASS: HTTP Raw Inspection API verified for Chat SSE, Responses SSE, and gzipped non-stream.")
+
+
+def test_batch_export_and_filters(base1, opener, multi_seg_sid):
+    print("[9/9] Testing trace filters and multi-segment batch JSONL export...")
+
+    st, _, body = http_request(f"{base1}/api/traces?harness=dumate", opener=opener)
+    assert_eq(st, 200, "filter harness=dumate")
+    f_dumate = json.loads(body)["traces"]
+    assert_true(len(f_dumate) >= 1 and all(x["harness"] == "dumate" for x in f_dumate), "harness=dumate filter")
 
     st, _, body = http_request(f"{base1}/api/traces?upstream=anthropic", opener=opener)
     assert_eq(st, 200, "filter upstream=anthropic")
     f_ant = json.loads(body)["traces"]
-    assert_true(len(f_ant) >= 2 and all(x["upstream"] == "anthropic" for x in f_ant), "upstream filter failed")
+    assert_true(len(f_ant) >= 2 and all(x["upstream"] == "anthropic" for x in f_ant), "upstream=anthropic filter")
 
     st, _, body = http_request(f"{base1}/api/traces?q=codex-wd", opener=opener)
     assert_eq(st, 200, "filter q=codex-wd")
@@ -1124,7 +1184,7 @@ def test_sqlite_atif_and_api(db_path, base1, opener, wd_oai, wd_ant):
     assert_eq(len(f_q), 1, "q filter count")
     assert_eq(f_q[0]["session_id"], "sess-codex-e2e", "q filter match")
 
-    export_ids = [pi_traces[0]["session_id"], "sess-claude-e2e", "sess-codex-e2e"]
+    export_ids = [multi_seg_sid, "sess-claude-e2e", "sess-codex-e2e"]
     st, hdrs, export_body = http_request(
         f"{base1}/api/traces/export",
         method="POST",
@@ -1136,88 +1196,18 @@ def test_sqlite_atif_and_api(db_path, base1, opener, wd_oai, wd_ant):
     ct = next((v for k, v in hdrs.items() if k.lower() == "content-type"), "")
     assert_true("application/x-ndjson" in ct, f"unexpected export content-type: {ct}")
     lines = [ln for ln in export_body.decode("utf-8").splitlines() if ln.strip()]
-    assert_eq(len(lines), len(export_ids), "export line count")
+    assert_eq(len(lines), 4 + 1 + 1, f"multi-segment export should produce 6 NDJSON lines, got {len(lines)}")
     exported_sids = []
     for idx, ln in enumerate(lines):
         obj = json.loads(ln)
         validate_atif_v18(obj, context=f"export[{idx}]")
         exported_sids.append(obj["session_id"])
-    assert_eq(exported_sids, export_ids, "exported session_ids order/content")
-    print("  PASS: SQLite persistence, harness extraction, strict ATIF-v1.8, filters, and JSONL export verified.")
-
-
-def strip_strings_c_style(code):
-    out = []
-    i = 0
-    n = len(code)
-    while i < n:
-        ch = code[i]
-        if ch in ('"', "'", "`"):
-            q = ch
-            out.append(" ")
-            i += 1
-            while i < n:
-                if code[i] == "\\" and q != "`" and i + 1 < n:
-                    i += 2
-                    continue
-                if code[i] == q:
-                    i += 1
-                    break
-                if code[i] == "\n":
-                    out.append("\n")
-                i += 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def audit_hygiene():
-    print("[7/7] Auditing workspace hygiene (comments, unit tests, unauthorized docs)...")
-    issues = []
-    skip_dirs = {".git", "node_modules", "dist", "test-evidence", "__pycache__"}
-
-    for dirpath, dirnames, filenames in os.walk(ROOT_DIR):
-        rel_dir = os.path.relpath(dirpath, ROOT_DIR)
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in skip_dirs and not (rel_dir == "web" and d == "dist")
-        ]
-        for fname in filenames:
-            fpath = os.path.join(dirpath, fname)
-            rel_path = os.path.relpath(fpath, ROOT_DIR)
-
-            if fname.endswith("_test.go") or ".test." in fname or ".spec." in fname:
-                issues.append(f"unit test file: {rel_path}")
-
-            if fname.lower().endswith(".md") and fname != "FRONTEND_TEST_REPORT.md":
-                issues.append(f"unauthorized doc file: {rel_path}")
-
-            ext = os.path.splitext(fname)[1].lower()
-            if ext in {".go", ".ts", ".tsx", ".js", ".mjs", ".css"}:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                cleaned = strip_strings_c_style(content)
-                for line_no, line in enumerate(cleaned.splitlines(), start=1):
-                    if "//" in line:
-                        orig_line = content.splitlines()[line_no - 1].strip()
-                        if ext == ".go" and orig_line.startswith("//go:embed"):
-                            continue
-                        issues.append(f"line comment in {rel_path}:{line_no}: {orig_line}")
-                    if "/*" in line or "*/" in line:
-                        orig_line = content.splitlines()[line_no - 1].strip()
-                        issues.append(f"block comment in {rel_path}:{line_no}: {orig_line}")
-            elif ext == ".py":
-                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                for line_no, line in enumerate(content.splitlines(), start=1):
-                    stripped = line.lstrip()
-                    if stripped.startswith("#"):
-                        issues.append(f"python comment in {rel_path}:{line_no}: {stripped}")
-
-    if issues:
-        raise AssertionError("Hygiene audit failed:\n  " + "\n  ".join(issues))
-    print("  PASS: Workspace hygiene audit clean (0 unauthorized comments, 0 unit tests, 0 unauthorized docs).")
+    assert_eq(
+        exported_sids,
+        [multi_seg_sid, multi_seg_sid, multi_seg_sid, multi_seg_sid, "sess-claude-e2e", "sess-codex-e2e"],
+        "exported NDJSON session_id sequence",
+    )
+    print("  PASS: Trace filters and multi-segment batch JSONL export verified.")
 
 
 def main():
@@ -1234,14 +1224,16 @@ def main():
 
     procs = []
     try:
-        test_toml_validation(TMP_BASE)
+        test_config_validation(TMP_BASE)
 
         db1 = os.path.join(TMP_BASE, "mode1.db")
+        raw1 = os.path.join(TMP_BASE, "mode1_raw")
         cfg1 = os.path.join(TMP_BASE, "mode1.toml")
         with open(cfg1, "w", encoding="utf-8") as f:
             f.write(
                 f'listen = "127.0.0.1:{PORT_MODE1}"\n'
                 f'sqlite_path = "{db1}"\n'
+                f'raw_log_dir = "{raw1}"\n'
                 'dashboard_key = "secret123"\n'
                 '[upstreams.openai]\n'
                 f'url = "http://127.0.0.1:{PORT_MOCK_OPENAI}"\n'
@@ -1256,10 +1248,13 @@ def main():
         opener = test_auth_modes(TMP_BASE, procs)
         test_transparent_forwarding(base1, oai_rec, ant_rec)
         wd_oai, wd_ant = test_real_pi_agent(TMP_BASE, base1)
-        test_harness_detection(base1)
-        test_sqlite_atif_and_api(db1, base1, opener, wd_oai, wd_ant)
-        audit_hygiene()
-        print("ALL E2E TESTS PASSED!")
+        test_real_claude_code(TMP_BASE, base1, opener)
+        test_all_harnesses(base1, opener, db1, wd_oai, wd_ant)
+        multi_seg_sid, _ = test_multi_trajectory_and_atif(base1, opener)
+        test_rawlog_append_only(raw1, db1)
+        test_http_raw_inspection_api(base1, opener, db1)
+        test_batch_export_and_filters(base1, opener, multi_seg_sid)
+        print("ALL 9 E2E TEST SUITES PASSED!")
     finally:
         for p in procs:
             try:

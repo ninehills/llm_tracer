@@ -31,7 +31,7 @@ func (e *ClaudeCodeExtractor) ExtractVersion(userAgent string, _ http.Header) st
 }
 
 func (e *ClaudeCodeExtractor) ExtractSessionID(headers http.Header, body []byte, _ *proxy.ParsedExchange) string {
-	if v := firstHeader(headers, "X-Session-Id", "X-Claude-Session-Id", "Anthropic-Session-Id"); v != "" {
+	if v := firstHeader(headers, "X-Claude-Code-Session-Id", "X-Session-Id", "X-Claude-Session-Id", "Anthropic-Session-Id"); v != "" {
 		return v
 	}
 	var payload struct {
@@ -40,10 +40,19 @@ func (e *ClaudeCodeExtractor) ExtractSessionID(headers http.Header, body []byte,
 		} `json:"metadata"`
 	}
 	if err := json.Unmarshal(body, &payload); err == nil && payload.Metadata.UserID != "" {
-		if m := reClaudeSession.FindStringSubmatch(payload.Metadata.UserID); len(m) > 1 {
+		uid := strings.TrimSpace(payload.Metadata.UserID)
+		if strings.HasPrefix(uid, "{") {
+			var metaUser struct {
+				SessionID string `json:"session_id"`
+			}
+			if err := json.Unmarshal([]byte(uid), &metaUser); err == nil && strings.TrimSpace(metaUser.SessionID) != "" {
+				return strings.TrimSpace(metaUser.SessionID)
+			}
+		}
+		if m := reClaudeSession.FindStringSubmatch(uid); len(m) > 1 {
 			return m[1]
 		}
-		return payload.Metadata.UserID
+		return uid
 	}
 	return ""
 }
@@ -52,6 +61,18 @@ func (e *ClaudeCodeExtractor) ExtractWorkDir(headers http.Header, body []byte, p
 	return extractCommonWorkDir(headers, body, parsed)
 }
 
-func (e *ClaudeCodeExtractor) ExtractMetadata(_ http.Header, _ []byte, _ *proxy.ParsedExchange) map[string]any {
-	return nil
+func (e *ClaudeCodeExtractor) ExtractMetadata(headers http.Header, _ []byte, parsed *proxy.ParsedExchange) map[string]any {
+	agentID := firstHeader(headers, "X-Claude-Code-Agent-Id")
+	isSub := agentID != "" || (parsed != nil && strings.Contains(parsed.SystemPrompt, "cc_is_subagent=true"))
+	if !isSub {
+		return nil
+	}
+	meta := map[string]any{
+		"source":      "subAgent",
+		"is_subagent": true,
+	}
+	if agentID != "" {
+		meta["subagent_id"] = agentID
+	}
+	return meta
 }

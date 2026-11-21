@@ -84,6 +84,7 @@ export async function fetchTraceTrajectories(sessionId: string): Promise<TraceTr
     if (res && Array.isArray(res.trajectories) && res.trajectories.length > 0) {
       return {
         session_id: res.session_id || sessionId,
+        upstream_url: res.upstream_url,
         llm_call_count: res.llm_call_count,
         trajectories: res.trajectories,
       };

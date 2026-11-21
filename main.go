@@ -55,7 +55,12 @@ func main() {
 		respPlain := proxy.DecompressIfGzip(ex.ResponseHeaders, ex.ResponseBody)
 		det := detector.Detect(ex.Upstream, ex.RequestHeaders, reqPlain, parsed)
 		if len(det.Metadata) > 0 {
-			parsed.Metadata = det.Metadata
+			if parsed.Metadata == nil {
+				parsed.Metadata = map[string]any{}
+			}
+			for k, v := range det.Metadata {
+				parsed.Metadata[k] = v
+			}
 		}
 
 		parsedBytes, _ := json.Marshal(parsed)
