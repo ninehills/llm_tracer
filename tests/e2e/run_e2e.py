@@ -1063,20 +1063,72 @@ def test_multi_trajectory_and_atif(base1, opener):
     return multi_seg_sid, resp_linear_sid
 
 
-def test_rawlog_append_only(raw_log_dir, db_path):
-    print("[7/9] Testing append-only daily RawLog JSONL...")
+def test_rawlog_zstd_and_sqlite_index(raw_log_dir, db_path, tmp_dir):
+    print("[7/9] Testing multi-frame Zstd RawLog, -dump CLI, and lightweight SQLite index...")
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    log_path = os.path.join(raw_log_dir, f"requests-{today}.jsonl")
-    assert_true(os.path.isfile(log_path), f"raw log file missing: {log_path}")
+    expected_rel = f"requests-{today}.jsonl.zst"
+    log_path = os.path.join(raw_log_dir, expected_rel)
+    assert_true(os.path.isfile(log_path), f"zstd raw log file missing: {log_path}")
+    assert_true(not os.path.exists(os.path.join(raw_log_dir, f"requests-{today}.jsonl")), "legacy uncompressed .jsonl should not be created")
+
+    with open(log_path, "rb") as f:
+        zst_bytes = f.read()
+    zstd_magic = b"\x28\xb5\x2f\xfd"
+    assert_true(len(zst_bytes) > 4 and zst_bytes[:4] == zstd_magic, "raw log file must start with Zstd frame magic")
 
     conn = sqlite3.connect(db_path)
-    req_count = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+    rows = conn.execute(
+        "SELECT id, rawlog_file, rawlog_offset, rawlog_length, request_body, response_body, parsed_json "
+        "FROM requests ORDER BY id ASC"
+    ).fetchall()
     conn.close()
 
-    with open(log_path, "r", encoding="utf-8") as f:
-        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    req_count = len(rows)
+    assert_true(req_count >= 10, f"expected at least 10 request rows, got {req_count}")
+    for row_id, rl_file, rl_off, rl_len, req_body, resp_body, parsed_json in rows:
+        assert_eq(rl_file, expected_rel, f"row {row_id} rawlog_file")
+        assert_true(isinstance(rl_off, int) and rl_off >= 0, f"row {row_id} rawlog_offset={rl_off!r}")
+        assert_true(isinstance(rl_len, int) and rl_len > 0, f"row {row_id} rawlog_length={rl_len!r}")
+        assert_true(rl_off + rl_len <= len(zst_bytes), f"row {row_id} frame out of bounds")
+        assert_eq(zst_bytes[rl_off : rl_off + 4], zstd_magic, f"row {row_id} offset does not point to Zstd frame magic")
+        assert_true(req_body in (None, b"", ""), f"row {row_id} inline request_body must be empty, got {len(req_body) if req_body else 0} bytes")
+        assert_true(resp_body in (None, b"", ""), f"row {row_id} inline response_body must be empty, got {len(resp_body) if resp_body else 0} bytes")
+        assert_eq(parsed_json, "", f"row {row_id} inline parsed_json must be empty")
 
-    assert_eq(len(lines), req_count, f"rawlog line count ({len(lines)}) must equal total proxied requests ({req_count})")
+    dump_stdout = subprocess.run(
+        [BINARY_PATH, "-dump", log_path],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert_eq(dump_stdout.returncode, 0, f"-dump stdout failed: stderr={dump_stdout.stderr!r}")
+
+    dump_out_path = os.path.join(tmp_dir, "dumped_rawlog.jsonl")
+    dump_file_res = subprocess.run(
+        [BINARY_PATH, "-dump", log_path, "-out", dump_out_path],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert_eq(dump_file_res.returncode, 0, f"-dump -out failed: stderr={dump_file_res.stderr!r}")
+    assert_true(os.path.isfile(dump_out_path), f"-dump -out file missing: {dump_out_path}")
+    with open(dump_out_path, "r", encoding="utf-8") as f:
+        dumped_text = f.read()
+    assert_eq(dump_stdout.stdout, dumped_text, "-dump stdout and -dump -out output must match identically")
+
+    zstd_bin = shutil.which("zstd")
+    if zstd_bin:
+        zstd_res = subprocess.run(
+            [zstd_bin, "-dc", log_path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert_eq(zstd_res.returncode, 0, f"zstd -dc failed: stderr={zstd_res.stderr!r}")
+        assert_eq(zstd_res.stdout, dumped_text, "zstd -dc output must match -dump output")
+
+    lines = [ln for ln in dumped_text.splitlines() if ln.strip()]
+    assert_eq(len(lines), req_count, f"dumped rawlog line count ({len(lines)}) must equal total proxied requests ({req_count})")
     for idx, ln in enumerate(lines):
         entry = json.loads(ln)
         assert_true(isinstance(entry.get("timestamp"), str) and len(entry["timestamp"]) > 0, f"rawlog[{idx}] timestamp")
@@ -1088,7 +1140,7 @@ def test_rawlog_append_only(raw_log_dir, db_path):
             assert_true(isinstance(entry.get("request_body"), str) and len(entry["request_body"]) > 0, f"rawlog[{idx}] request_body")
             assert_true(isinstance(entry.get("response_body"), str) and len(entry["response_body"]) > 0, f"rawlog[{idx}] response_body")
 
-    print(f"  PASS: Append-only RawLog verified ({len(lines)} lines in requests-{today}.jsonl).")
+    print(f"  PASS: Multi-frame Zstd RawLog ({len(lines)} frames in {expected_rel}), -dump CLI, and lightweight SQLite index verified.")
 
 
 def wait_for_request_id(db_path, session_id, timeout=5.0):
@@ -1140,6 +1192,9 @@ def test_http_raw_inspection_api(base1, opener, db_path):
     assert_true(isinstance(chat_raw.get("merged_response"), dict), "chat merged_response dict")
     assert_true(len(chat_raw.get("api_key_hash", "")) == 64, "chat api_key_hash")
     assert_eq(chat_raw.get("client_ip"), "127.0.0.1", "chat client_ip")
+    chat_hdr_dump = json.dumps(chat_raw.get("request_headers") or {})
+    assert_true("sk-e2e-" not in chat_hdr_dump, f"chat SSE request_headers leaked secret: {chat_hdr_dump}")
+    assert_true("[REDACTED]" in chat_hdr_dump, f"chat SSE request_headers missing redaction marker: {chat_hdr_dump}")
 
     st, _, body = http_request(f"{base1}/api/requests/{resp_sse_id}", opener=opener)
     assert_eq(st, 200, "GET /api/requests/{resp_sse_id}")
@@ -1162,7 +1217,10 @@ def test_http_raw_inspection_api(base1, opener, db_path):
     assert_true("Gzipped request inspection check" in gzip_raw["request_body"], "gzip request_body decompressed")
     assert_true("sse_events" not in gzip_raw, "non-stream omits sse_events")
     assert_true("merged_response" not in gzip_raw, "non-stream omits merged_response")
-    print("  PASS: HTTP Raw Inspection API verified for Chat SSE, Responses SSE, and gzipped non-stream.")
+    gzip_hdr_dump = json.dumps(gzip_raw.get("request_headers") or {})
+    assert_true("sk-gzip-check" not in gzip_hdr_dump, f"gzip request_headers leaked secret: {gzip_hdr_dump}")
+    assert_true("[REDACTED]" in gzip_hdr_dump, f"gzip request_headers missing redaction marker: {gzip_hdr_dump}")
+    print("  PASS: HTTP Raw Inspection API verified for Chat SSE, Responses SSE, gzipped non-stream, and Zstd O(1) hydration with redacted headers.")
 
 
 def test_batch_export_and_filters(base1, opener, multi_seg_sid):
@@ -1251,7 +1309,7 @@ def main():
         test_real_claude_code(TMP_BASE, base1, opener)
         test_all_harnesses(base1, opener, db1, wd_oai, wd_ant)
         multi_seg_sid, _ = test_multi_trajectory_and_atif(base1, opener)
-        test_rawlog_append_only(raw1, db1)
+        test_rawlog_zstd_and_sqlite_index(raw1, db1, TMP_BASE)
         test_http_raw_inspection_api(base1, opener, db1)
         test_batch_export_and_filters(base1, opener, multi_seg_sid)
         print("ALL 9 E2E TEST SUITES PASSED!")

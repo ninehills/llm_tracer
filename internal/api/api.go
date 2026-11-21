@@ -269,7 +269,7 @@ func (s *Server) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reqHeaders := parseStoredHeaders(rec.RequestHeaders)
+	reqHeaders := parseStoredHeaders(storage.SanitizeHeadersJSON(http.Header(parseStoredHeaders(rec.RequestHeaders))))
 	respHeaders := parseStoredHeaders(rec.ResponseHeaders)
 
 	reqBody := proxy.DecompressIfGzip(http.Header(reqHeaders), rec.RequestBody)

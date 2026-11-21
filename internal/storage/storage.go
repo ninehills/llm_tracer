@@ -8,12 +8,16 @@ import (
 	"strings"
 	"sync"
 
+	"llm_tracer/internal/proxy"
+	"llm_tracer/internal/rawlog"
+
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db *sql.DB
-	mu sync.Mutex
+	db     *sql.DB
+	mu     sync.Mutex
+	rawlog *rawlog.Writer
 }
 
 type SessionSummary struct {
@@ -61,6 +65,9 @@ type RequestRecord struct {
 	PromptTokens     int
 	CompletionTokens int
 	CachedTokens     int
+	RawLogFile       string
+	RawLogOffset     int64
+	RawLogLength     int64
 }
 
 type TraceFilter struct {
@@ -83,6 +90,12 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func (s *Store) SetRawLog(rl *rawlog.Writer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rawlog = rl
 }
 
 func (s *Store) Close() error {
@@ -136,6 +149,9 @@ func (s *Store) initSchema() error {
 			prompt_tokens INTEGER NOT NULL DEFAULT 0,
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
 			cached_tokens INTEGER NOT NULL DEFAULT 0,
+			rawlog_file TEXT NOT NULL DEFAULT '',
+			rawlog_offset INTEGER NOT NULL DEFAULT 0,
+			rawlog_length INTEGER NOT NULL DEFAULT 0,
 			FOREIGN KEY(session_id) REFERENCES sessions(session_id)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_session_seq ON requests(session_id, seq);`,
@@ -151,6 +167,9 @@ func (s *Store) initSchema() error {
 	_, _ = s.db.Exec(`ALTER TABLE sessions ADD COLUMN api_key_hash TEXT NOT NULL DEFAULT '';`)
 	_, _ = s.db.Exec(`ALTER TABLE requests ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';`)
 	_, _ = s.db.Exec(`ALTER TABLE requests ADD COLUMN api_key_hash TEXT NOT NULL DEFAULT '';`)
+	_, _ = s.db.Exec(`ALTER TABLE requests ADD COLUMN rawlog_file TEXT NOT NULL DEFAULT '';`)
+	_, _ = s.db.Exec(`ALTER TABLE requests ADD COLUMN rawlog_offset INTEGER NOT NULL DEFAULT 0;`)
+	_, _ = s.db.Exec(`ALTER TABLE requests ADD COLUMN rawlog_length INTEGER NOT NULL DEFAULT 0;`)
 	return nil
 }
 
@@ -242,17 +261,29 @@ func (s *Store) RecordExchange(sess SessionSummary, rec RequestRecord, stepCount
 	if rec.IsStream {
 		isStreamInt = 1
 	}
+
+	reqBody := rec.RequestBody
+	respBody := rec.ResponseBody
+	parsedJSON := rec.ParsedJSON
+	if rec.RawLogFile != "" {
+		reqBody = nil
+		respBody = nil
+		parsedJSON = ""
+	}
+
 	_, err = tx.Exec(
 		`INSERT INTO requests (
 			session_id, seq, upstream, method, path, query, protocol, model, client_ip, api_key_hash,
 			is_stream, status_code, started_at, completed_at, duration_ms,
 			request_headers, response_headers, request_body, response_body,
-			parsed_json, prompt_tokens, completion_tokens, cached_tokens
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			parsed_json, prompt_tokens, completion_tokens, cached_tokens,
+			rawlog_file, rawlog_offset, rawlog_length
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.SessionID, rec.Seq, rec.Upstream, rec.Method, rec.Path, rec.Query, rec.Protocol, rec.Model, rec.ClientIP, rec.APIKeyHash,
 		isStreamInt, rec.StatusCode, rec.StartedAt, rec.CompletedAt, rec.DurationMs,
-		rec.RequestHeaders, rec.ResponseHeaders, rec.RequestBody, rec.ResponseBody,
-		rec.ParsedJSON, rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens,
+		rec.RequestHeaders, rec.ResponseHeaders, reqBody, respBody,
+		parsedJSON, rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens,
+		rec.RawLogFile, rec.RawLogOffset, rec.RawLogLength,
 	)
 	if err != nil {
 		return err
@@ -381,7 +412,8 @@ func (s *Store) GetSessionRequests(sessionID string) ([]RequestRecord, error) {
 		`SELECT id, session_id, seq, upstream, method, path, query, protocol, model, client_ip, api_key_hash,
 		is_stream, status_code, started_at, completed_at, duration_ms,
 		request_headers, response_headers, request_body, response_body,
-		parsed_json, prompt_tokens, completion_tokens, cached_tokens
+		parsed_json, prompt_tokens, completion_tokens, cached_tokens,
+		rawlog_file, rawlog_offset, rawlog_length
 		FROM requests WHERE session_id = ? ORDER BY started_at ASC, id ASC`,
 		sessionID,
 	)
@@ -391,6 +423,7 @@ func (s *Store) GetSessionRequests(sessionID string) ([]RequestRecord, error) {
 	defer rows.Close()
 
 	out := make([]RequestRecord, 0)
+	refs := make([]rawlog.Ref, 0)
 	for rows.Next() {
 		var r RequestRecord
 		var isStreamInt int
@@ -399,13 +432,35 @@ func (s *Store) GetSessionRequests(sessionID string) ([]RequestRecord, error) {
 			&isStreamInt, &r.StatusCode, &r.StartedAt, &r.CompletedAt, &r.DurationMs,
 			&r.RequestHeaders, &r.ResponseHeaders, &r.RequestBody, &r.ResponseBody,
 			&r.ParsedJSON, &r.PromptTokens, &r.CompletionTokens, &r.CachedTokens,
+			&r.RawLogFile, &r.RawLogOffset, &r.RawLogLength,
 		); err != nil {
 			return nil, err
 		}
 		r.IsStream = isStreamInt != 0
+		if r.RawLogFile != "" && r.RawLogLength > 0 {
+			refs = append(refs, rawlog.Ref{
+				ID:     r.ID,
+				File:   r.RawLogFile,
+				Offset: r.RawLogOffset,
+				Length: r.RawLogLength,
+			})
+		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(refs) > 0 && s.rawlog != nil {
+		entries, _ := s.rawlog.ReadBatch(refs)
+		for i := range out {
+			if entry, ok := entries[out[i].ID]; ok && entry != nil {
+				hydrateRecordFromRawLog(&out[i], entry)
+			}
+		}
+	}
+
+	return out, nil
 }
 
 func (s *Store) GetRequestByID(id int64) (*RequestRecord, error) {
@@ -415,7 +470,8 @@ func (s *Store) GetRequestByID(id int64) (*RequestRecord, error) {
 		`SELECT id, session_id, seq, upstream, method, path, query, protocol, model, client_ip, api_key_hash,
 		is_stream, status_code, started_at, completed_at, duration_ms,
 		request_headers, response_headers, request_body, response_body,
-		parsed_json, prompt_tokens, completion_tokens, cached_tokens
+		parsed_json, prompt_tokens, completion_tokens, cached_tokens,
+		rawlog_file, rawlog_offset, rawlog_length
 		FROM requests WHERE id = ?`,
 		id,
 	).Scan(
@@ -423,12 +479,245 @@ func (s *Store) GetRequestByID(id int64) (*RequestRecord, error) {
 		&isStreamInt, &r.StatusCode, &r.StartedAt, &r.CompletedAt, &r.DurationMs,
 		&r.RequestHeaders, &r.ResponseHeaders, &r.RequestBody, &r.ResponseBody,
 		&r.ParsedJSON, &r.PromptTokens, &r.CompletionTokens, &r.CachedTokens,
+		&r.RawLogFile, &r.RawLogOffset, &r.RawLogLength,
 	)
 	if err != nil {
 		return nil, err
 	}
 	r.IsStream = isStreamInt != 0
+	if r.RawLogFile != "" && r.RawLogLength > 0 && s.rawlog != nil {
+		if entry, rErr := s.rawlog.ReadAt(r.RawLogFile, r.RawLogOffset, r.RawLogLength); rErr == nil && entry != nil {
+			hydrateRecordFromRawLog(&r, entry)
+		}
+	}
 	return &r, nil
+}
+
+func (s *Store) MigrateInlineBodiesToRawLog(rl *rawlog.Writer) (int, error) {
+	if rl == nil {
+		return 0, fmt.Errorf("rawlog writer is nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(
+		`SELECT r.id, r.session_id, r.upstream, r.method, r.path, r.query,
+			r.client_ip, r.api_key_hash, r.status_code, r.started_at, r.duration_ms,
+			r.request_headers, r.response_headers, r.request_body, r.response_body, r.parsed_json,
+			COALESCE(s.harness, ''), COALESCE(s.harness_version, ''), COALESCE(s.work_dir, '')
+		FROM requests r
+		LEFT JOIN sessions s ON s.session_id = r.session_id
+		WHERE r.rawlog_file = '' AND (
+			length(COALESCE(r.request_body, '')) > 0 OR
+			length(COALESCE(r.response_body, '')) > 0 OR
+			(r.parsed_json != '' AND r.parsed_json != '{}')
+		)
+		ORDER BY r.id ASC`,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	type migrationRow struct {
+		id              int64
+		sessionID       string
+		upstream        string
+		method          string
+		path            string
+		query           string
+		clientIP        string
+		apiKeyHash      string
+		statusCode      int
+		startedAt       string
+		durationMs      int64
+		requestHeaders  string
+		responseHeaders string
+		requestBody     []byte
+		responseBody    []byte
+		parsedJSON      string
+		harness         string
+		harnessVersion  string
+		workDir         string
+	}
+
+	pending := make([]migrationRow, 0)
+	for rows.Next() {
+		var mr migrationRow
+		if err := rows.Scan(
+			&mr.id, &mr.sessionID, &mr.upstream, &mr.method, &mr.path, &mr.query,
+			&mr.clientIP, &mr.apiKeyHash, &mr.statusCode, &mr.startedAt, &mr.durationMs,
+			&mr.requestHeaders, &mr.responseHeaders, &mr.requestBody, &mr.responseBody, &mr.parsedJSON,
+			&mr.harness, &mr.harnessVersion, &mr.workDir,
+		); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		pending = append(pending, mr)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	_ = rows.Close()
+
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	migrated := 0
+	for _, mr := range pending {
+		reqHdrs := parseHeadersMap(mr.requestHeaders)
+		respHdrs := parseHeadersMap(mr.responseHeaders)
+		reqPlain := proxy.DecompressIfGzip(reqHdrs, mr.requestBody)
+		respPlain := proxy.DecompressIfGzip(respHdrs, mr.responseBody)
+
+		var meta map[string]any
+		if mr.parsedJSON != "" && mr.parsedJSON != "{}" {
+			var parsed proxy.ParsedExchange
+			if uErr := json.Unmarshal([]byte(mr.parsedJSON), &parsed); uErr == nil && len(parsed.Metadata) > 0 {
+				meta = parsed.Metadata
+			}
+		}
+
+		relFile, offset, length, aErr := rl.Append(rawlog.Entry{
+			Timestamp:       mr.startedAt,
+			SessionID:       mr.sessionID,
+			Harness:         mr.harness,
+			HarnessVersion:  mr.harnessVersion,
+			Upstream:        mr.upstream,
+			Method:          mr.method,
+			Path:            mr.path,
+			Query:           mr.query,
+			ClientIP:        mr.clientIP,
+			APIKeyHash:      mr.apiKeyHash,
+			RequestHeaders:  reqHdrs,
+			RequestBody:     string(reqPlain),
+			StatusCode:      mr.statusCode,
+			ResponseHeaders: respHdrs,
+			ResponseBody:    string(respPlain),
+			LatencyMs:       mr.durationMs,
+			WorkDir:         mr.workDir,
+			Metadata:        meta,
+		})
+		if aErr != nil {
+			err = aErr
+			return migrated, err
+		}
+
+		if _, err = tx.Exec(
+			`UPDATE requests SET rawlog_file = ?, rawlog_offset = ?, rawlog_length = ?, request_body = NULL, response_body = NULL, parsed_json = '' WHERE id = ?`,
+			relFile, offset, length, mr.id,
+		); err != nil {
+			return migrated, err
+		}
+		migrated++
+	}
+
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+	if _, vErr := s.db.Exec(`VACUUM;`); vErr != nil {
+		return migrated, vErr
+	}
+	_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+
+	return migrated, nil
+}
+
+func hydrateRecordFromRawLog(rec *RequestRecord, entry *rawlog.Entry) {
+	rec.RequestBody = []byte(entry.RequestBody)
+	rec.ResponseBody = []byte(entry.ResponseBody)
+
+	if (rec.RequestHeaders == "" || rec.RequestHeaders == "{}") && len(entry.RequestHeaders) > 0 {
+		rec.RequestHeaders = SanitizeHeadersJSON(entry.RequestHeaders)
+	}
+	if (rec.ResponseHeaders == "" || rec.ResponseHeaders == "{}") && len(entry.ResponseHeaders) > 0 {
+		rec.ResponseHeaders = SanitizeHeadersJSON(entry.ResponseHeaders)
+	}
+
+	if rec.ParsedJSON == "" || rec.ParsedJSON == "{}" {
+		reqHdrs := entry.RequestHeaders
+		if len(reqHdrs) == 0 {
+			reqHdrs = parseHeadersMap(rec.RequestHeaders)
+		}
+		respHdrs := entry.ResponseHeaders
+		if len(respHdrs) == 0 {
+			respHdrs = parseHeadersMap(rec.ResponseHeaders)
+		}
+		parsed := proxy.ParseExchange(rec.Path, reqHdrs, rec.RequestBody, respHdrs, rec.ResponseBody)
+		if rec.ClientIP != "" {
+			parsed.ClientIP = rec.ClientIP
+		} else if entry.ClientIP != "" {
+			parsed.ClientIP = entry.ClientIP
+		}
+		if rec.APIKeyHash != "" {
+			parsed.APIKeyHash = rec.APIKeyHash
+		} else if entry.APIKeyHash != "" {
+			parsed.APIKeyHash = entry.APIKeyHash
+		} else if hasRedactedAuth(reqHdrs) {
+			parsed.APIKeyHash = ""
+		}
+		if len(entry.Metadata) > 0 {
+			if parsed.Metadata == nil {
+				parsed.Metadata = map[string]any{}
+			}
+			for k, v := range entry.Metadata {
+				parsed.Metadata[k] = v
+			}
+		}
+		if b, err := json.Marshal(parsed); err == nil {
+			rec.ParsedJSON = string(b)
+		}
+	}
+}
+
+func parseHeadersMap(raw string) http.Header {
+	out := http.Header{}
+	if strings.TrimSpace(raw) == "" {
+		return out
+	}
+	var multi map[string][]string
+	if err := json.Unmarshal([]byte(raw), &multi); err == nil && len(multi) > 0 {
+		for k, vals := range multi {
+			for _, v := range vals {
+				out.Add(k, v)
+			}
+		}
+		return out
+	}
+	var single map[string]string
+	if err := json.Unmarshal([]byte(raw), &single); err == nil {
+		for k, v := range single {
+			out.Set(k, v)
+		}
+	}
+	return out
+}
+
+func hasRedactedAuth(h http.Header) bool {
+	for k, vals := range h {
+		lk := strings.ToLower(k)
+		if lk == "authorization" || lk == "x-api-key" || lk == "api-key" {
+			for _, v := range vals {
+				if strings.TrimSpace(v) == "[REDACTED]" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func SanitizeHeadersJSON(h http.Header) string {

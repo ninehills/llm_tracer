@@ -4,9 +4,11 @@ import (
 	"embed"
 	"encoding/json"
 	"flag"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"llm_tracer/internal/api"
@@ -23,7 +25,35 @@ var embeddedWeb embed.FS
 
 func main() {
 	configPath := flag.String("config", "config.toml", "path to TOML config file")
+	migrateOnly := flag.Bool("migrate", false, "migrate inline sqlite bodies to raw_logs and exit")
+	dumpPath := flag.String("dump", "", "dump a raw log (.jsonl.zst or .jsonl) file to plain JSONL")
+	outPath := flag.String("out", "", "output file path for -dump (defaults to stdout)")
 	flag.Parse()
+
+	if *dumpPath != "" {
+		var dst io.Writer = os.Stdout
+		var outFile *os.File
+		if *outPath != "" {
+			f, err := os.OpenFile(*outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			if err != nil {
+				log.Fatalf("failed to create output file: %v", err)
+			}
+			outFile = f
+			dst = f
+		}
+		if err := rawlog.DumpToWriter(*dumpPath, dst); err != nil {
+			if outFile != nil {
+				_ = outFile.Close()
+			}
+			log.Fatalf("failed to dump raw log: %v", err)
+		}
+		if outFile != nil {
+			if err := outFile.Close(); err != nil {
+				log.Fatalf("failed to close output file: %v", err)
+			}
+		}
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -39,6 +69,20 @@ func main() {
 	rawWriter, err := rawlog.NewWriter(cfg.RawLogDir)
 	if err != nil {
 		log.Fatalf("failed to initialize raw log writer: %v", err)
+	}
+	defer rawWriter.Close()
+
+	store.SetRawLog(rawWriter)
+
+	migrated, err := store.MigrateInlineBodiesToRawLog(rawWriter)
+	if err != nil {
+		log.Fatalf("failed to migrate inline bodies to raw logs: %v", err)
+	}
+	if migrated > 0 {
+		log.Printf("migrated %d inline request records to raw_logs", migrated)
+	}
+	if *migrateOnly {
+		return
 	}
 
 	backfillSessions(store)
@@ -67,7 +111,7 @@ func main() {
 		startedStr := ex.StartedAt.Format(time.RFC3339Nano)
 		completedStr := ex.CompletedAt.Format(time.RFC3339Nano)
 
-		if err := rawWriter.Append(rawlog.Entry{
+		relFile, offset, length, rawErr := rawWriter.Append(rawlog.Entry{
 			Timestamp:       startedStr,
 			SessionID:       det.SessionID,
 			Harness:         det.Harness,
@@ -86,8 +130,9 @@ func main() {
 			LatencyMs:       ex.DurationMs,
 			WorkDir:         det.WorkDir,
 			Metadata:        det.Metadata,
-		}); err != nil {
-			log.Printf("raw log append error: %v", err)
+		})
+		if rawErr != nil {
+			log.Printf("raw log append error: %v", rawErr)
 		}
 
 		sess := storage.SessionSummary{
@@ -125,6 +170,9 @@ func main() {
 			PromptTokens:     parsed.PromptTokens,
 			CompletionTokens: parsed.CompletionTokens,
 			CachedTokens:     parsed.CachedTokens,
+			RawLogFile:       relFile,
+			RawLogOffset:     offset,
+			RawLogLength:     length,
 		}
 		if err := store.RecordExchange(sess, rec, 0); err != nil {
 			log.Printf("record exchange error: %v", err)
