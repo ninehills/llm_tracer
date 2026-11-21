@@ -4,6 +4,7 @@ import http.cookiejar
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -1268,6 +1269,76 @@ def test_batch_export_and_filters(base1, opener, multi_seg_sid):
     print("  PASS: Trace filters and multi-segment batch JSONL export verified.")
 
 
+def is_port_free(host, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def test_zero_config_startup(tmp_dir, procs):
+    print("[10/10] Testing zero-config startup (auto-created config.toml & ./data/ dirs)...")
+    missing_explicit = os.path.join(tmp_dir, "explicit_missing.toml")
+    res_missing = subprocess.run(
+        [BINARY_PATH, "-config", missing_explicit],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert_true(res_missing.returncode != 0, "explicit missing -config should fail")
+    assert_true(not os.path.exists(missing_explicit), "explicit missing -config must not be auto-created")
+
+    zero_dir = os.path.join(tmp_dir, "zero_config_dir")
+    os.makedirs(zero_dir, exist_ok=True)
+    port_8080_free = is_port_free("127.0.0.1", 8080)
+
+    if port_8080_free:
+        p = subprocess.Popen([BINARY_PATH], cwd=zero_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        procs.append(p)
+        wait_port("127.0.0.1", 8080)
+        st, _, body = http_request("http://127.0.0.1:8080/api/auth/status")
+        assert_eq(st, 200, "zero-config /api/auth/status")
+        data = json.loads(body)
+        assert_eq(data["auth_required"], False, "zero-config auth_required")
+        assert_eq(data["is_localhost"], True, "zero-config is_localhost")
+        p.terminate()
+        p.wait(timeout=5)
+    else:
+        subprocess.run([BINARY_PATH], cwd=zero_dir, capture_output=True, text=True, timeout=5)
+
+    cfg_path = os.path.join(zero_dir, "config.toml")
+    db_path = os.path.join(zero_dir, "data", "llm_tracer.db")
+    logs_dir = os.path.join(zero_dir, "data", "logs")
+    assert_true(os.path.isfile(cfg_path), f"auto-created config.toml missing: {cfg_path}")
+    assert_true(os.path.isfile(db_path), f"auto-created data/llm_tracer.db missing: {db_path}")
+    assert_true(os.path.isdir(logs_dir), f"auto-created data/logs dir missing: {logs_dir}")
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg_text = f.read()
+    assert_true('listen = "127.0.0.1:8080"' in cfg_text, "default listen in config.toml")
+    assert_true('sqlite_path = "./data/llm_tracer.db"' in cfg_text, "default sqlite_path in config.toml")
+    assert_true('raw_log_dir = "./data/logs"' in cfg_text, "default raw_log_dir in config.toml")
+    assert_true("[upstreams.openai]" in cfg_text, "default openai upstream in config.toml")
+    assert_true("[upstreams.anthropic]" in cfg_text, "default anthropic upstream in config.toml")
+
+    if not port_8080_free:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(cfg_text.replace("127.0.0.1:8080", f"127.0.0.1:{PORT_CFG_TEST}"))
+        p = subprocess.Popen([BINARY_PATH], cwd=zero_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        procs.append(p)
+        wait_port("127.0.0.1", PORT_CFG_TEST)
+        st, _, _ = http_request(f"http://127.0.0.1:{PORT_CFG_TEST}/api/auth/status")
+        assert_eq(st, 200, "zero-config fallback port /api/auth/status")
+        p.terminate()
+        p.wait(timeout=5)
+
+    print("  PASS: Zero-config startup auto-created config.toml, data/llm_tracer.db, data/logs/ and served /api/auth/status.")
+
+
 def main():
     if os.path.exists(TMP_BASE):
         shutil.rmtree(TMP_BASE)
@@ -1312,7 +1383,8 @@ def main():
         test_rawlog_zstd_and_sqlite_index(raw1, db1, TMP_BASE)
         test_http_raw_inspection_api(base1, opener, db1)
         test_batch_export_and_filters(base1, opener, multi_seg_sid)
-        print("ALL 9 E2E TEST SUITES PASSED!")
+        test_zero_config_startup(TMP_BASE, procs)
+        print("ALL 10 E2E TEST SUITES PASSED!")
     finally:
         for p in procs:
             try:

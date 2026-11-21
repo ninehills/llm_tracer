@@ -1,6 +1,6 @@
 listen = "127.0.0.1:13425"
-sqlite_path = "./llm_tracer.db"
-raw_log_dir = "./raw_logs"
+sqlite_path = "./data/llm_tracer.db"
+raw_log_dir = "./data/logs"
 dashboard_key = ""
 
 [upstreams.openai]

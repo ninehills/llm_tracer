@@ -4,6 +4,7 @@ config.toml
 *.db-wal
 *.db-shm
 *.log
+data/
 raw_logs/
 llm_tracer
 web/node_modules/

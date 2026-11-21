@@ -13,7 +13,7 @@
 - **多 Harness 自动识别**：开箱支持 **Pi**、**DuMate**、**Claude Code**、**Codex**、**OpenCode** 及通用客户端（Generic），自动提取 Agent 版本号、Session ID、工作目录（`work_dir`）与扩展元数据。
 - **双轨数据持久化**：
   - **轻量 SQLite 索引**：仅存储会话摘要、请求元数据、脱敏请求头、Token 统计及 RawLog 帧定位索引 `(rawlog_file, rawlog_offset, rawlog_length)`，不在 SQLite 内联保存大报文。
-  - **多帧拼接 Zstd 原始日志**：按天追加写入 `raw_logs/requests-YYYY-MM-DD.jsonl.zst`（每条记录独立 Zstd Frame），支持 O(1) 随机定位按需解压，同时原生兼容 `zstd -dc` 与内置 `-dump` 命令。
+  - **多帧拼接 Zstd 原始日志**：按天追加写入 `data/logs/requests-YYYY-MM-DD.jsonl.zst`（每条记录独立 Zstd Frame），支持 O(1) 随机定位按需解压，同时原生兼容 `zstd -dc` 与内置 `-dump` 命令。
 - **单二进制嵌入式 Dashboard**：基于 React + TypeScript + Vite 构建并通过 `//go:embed` 打入单个 Go 可执行文件，支持 **浅色 / 深色（Light / Dark）主题** 与 **中文 / 英文（ZH / EN）界面**。
 - **Raw HTTP & SSE 深度检视**：内置 HTTP Inspector，支持流式 SSE 的 **Merged（聚合视图）**、**SSE Chunks（逐帧视图）** 与 **Raw SSE** 切换，以及按请求顺序展示 Tools Schema。
 - **安全与审计**：自动对请求头中的 API Key 进行脱敏，仅保存 **SHA-256 哈希前缀** 与 **Client IP**；支持可选的 `dashboard_key` 登录鉴权与非本机无鉴权安全警告。
@@ -38,28 +38,36 @@
 
 ## 快速开始
 
-### 1. 环境要求
+### 方式一：下载预编译二进制（推荐）
 
-- Go 1.24+
-- Node.js 20+ & npm（用于编译内置前端）
+前往 [GitHub Releases](https://github.com/ninehills/llm_tracer/releases) 下载对应平台的单二进制压缩包（支持 `linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`），解压后直接运行：
 
-### 2. 编译单二进制
+```bash
+# 以 macOS Apple Silicon 为例（按实际版本与平台替换文件名）
+tar -xzf llm_tracer-v0.1-darwin-arm64.tar.gz
+./llm_tracer
+```
+
+> **零配置开箱即用**：不带 `-config` 参数直接运行 `./llm_tracer` 时，若当前目录不存在 `config.toml`，程序会自动生成默认 `config.toml`（监听 `127.0.0.1:8080`，预置 `openai` 与 `anthropic` 上游）并自动创建 `./data/` 与 `./data/logs/` 目录。启动后直接访问 `http://127.0.0.1:8080`。
+
+### 方式二：从源码编译
+
+环境要求：Go 1.25+、Node.js 20+ & npm（用于编译内置前端）。
 
 ```bash
 make build
+./llm_tracer
 ```
 
 > `make build` 会先在 `web/` 中执行 `npm install && npm run build` 生成 `web/dist/`，再执行 `go build -o llm_tracer .` 将前端静态资源直接嵌入二进制文件。
 
-### 3. 创建配置并启动
+如需自定义端口或上游配置，也可基于示例文件启动：
 
 ```bash
 cp config.toml.example config.toml
 # 按需编辑 config.toml 中的监听地址与上游 URL
 ./llm_tracer -config config.toml
 ```
-
-启动后访问 Dashboard：`http://127.0.0.1:13425`
 
 ---
 
@@ -71,11 +79,11 @@ cp config.toml.example config.toml
 # 服务监听地址（默认 127.0.0.1:8080；示例使用 13425）
 listen = "127.0.0.1:13425"
 
-# SQLite 数据库文件路径
-sqlite_path = "./llm_tracer.db"
+# SQLite 数据库文件路径（默认 ./data/llm_tracer.db，自动创建父目录）
+sqlite_path = "./data/llm_tracer.db"
 
-# 按天追加的多帧 Zstd 原始日志目录
-raw_log_dir = "./raw_logs"
+# 按天追加的多帧 Zstd 原始日志目录（默认 ./data/logs，自动创建目录）
+raw_log_dir = "./data/logs"
 
 # Dashboard 访问密钥；留空表示免登录
 # 注意：当 listen 为非本机地址（如 0.0.0.0:13425）且 dashboard_key 为空时，
@@ -96,8 +104,8 @@ url = "http://127.0.0.1:8000"
 | 配置项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `listen` | `127.0.0.1:8080` | HTTP 监听地址（同时提供 `/proxy/*` 代理与 Dashboard） |
-| `sqlite_path` | `llm_tracer.db` | SQLite 数据库文件路径（WAL 模式） |
-| `raw_log_dir` | `./raw_logs` | 每日多帧 Zstd 原始请求/响应日志（`.jsonl.zst`）落盘目录 |
+| `sqlite_path` | `./data/llm_tracer.db` | SQLite 数据库文件路径（WAL 模式，自动创建父目录） |
+| `raw_log_dir` | `./data/logs` | 每日多帧 Zstd 原始请求/响应日志（`.jsonl.zst`）落盘目录 |
 | `dashboard_key` | `""` | 非空时启用 Dashboard Cookie 登录鉴权；非本机监听强烈建议设置 |
 | `[upstreams.<name>].url` | 必填 | 上游服务根地址（`http://` 或 `https://`），转发路径为 `/proxy/<name>/<path>` |
 
@@ -216,15 +224,15 @@ PI_CODING_AGENT_DIR=~/.pi-tracer \
    - `sessions` 表记录会话级元数据（`session_id`、`harness`、`harness_version`、`work_dir`、`upstream`、`model`、`client_ip`、`api_key_hash`、`step_count`、`trajectory_count` 及汇总 Token）。
    - `requests` 表仅保存脱敏 Headers、耗时、Token 统计以及多帧 Zstd 定位索引 `(rawlog_file, rawlog_offset, rawlog_length)`，不内联保存原始请求/响应体与中间解析 JSON，大幅缩小数据库体积。查询详情与轨迹时按 `(rawlog_file, rawlog_offset, rawlog_length)` 进行 O(1) 随机 Seek 并按需解压。
 2. **多帧拼接 Zstd 原始日志（`raw_log_dir`）**：
-   - 每日追加写入 `raw_logs/requests-YYYY-MM-DD.jsonl.zst`，每条 JSONL 记录作为独立 Zstd Frame 拼接落盘（含解压后的原始请求/响应正文、时间戳、Client IP、API Key SHA-256 哈希与 Harness 元数据），既支持 O(1) 单条随机读取，又完全符合标准多帧 Zstd 规范。
+   - 每日追加写入 `data/logs/requests-YYYY-MM-DD.jsonl.zst`，每条 JSONL 记录作为独立 Zstd Frame 拼接落盘（含解压后的原始请求/响应正文、时间戳、Client IP、API Key SHA-256 哈希与 Harness 元数据），既支持 O(1) 单条随机读取，又完全符合标准多帧 Zstd 规范。
    - **本地导出为明文 JSONL**：
      ```bash
      # 输出到标准输出
-     ./llm_tracer -dump raw_logs/requests-YYYY-MM-DD.jsonl.zst
+     ./llm_tracer -dump data/logs/requests-YYYY-MM-DD.jsonl.zst
      # 导出到指定文件
-     ./llm_tracer -dump raw_logs/requests-YYYY-MM-DD.jsonl.zst -out output.jsonl
+     ./llm_tracer -dump data/logs/requests-YYYY-MM-DD.jsonl.zst -out output.jsonl
      # 也原生兼容标准 zstd CLI
-     zstd -dc raw_logs/requests-YYYY-MM-DD.jsonl.zst > output.jsonl
+     zstd -dc data/logs/requests-YYYY-MM-DD.jsonl.zst > output.jsonl
      ```
 3. **ATIF-v1.8 严格前缀多轨迹**：
    - 当同一 Session 内连续请求满足有序 `tools` 一致且 `messages` 严格为前缀追加时，归入同一条轨迹。

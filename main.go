@@ -55,6 +55,21 @@ func main() {
 		return
 	}
 
+	configFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			configFlagSet = true
+		}
+	})
+	if !configFlagSet {
+		if _, err := os.Stat(*configPath); os.IsNotExist(err) {
+			if err := config.WriteDefault(*configPath); err != nil {
+				log.Fatalf("failed to create default config %s: %v", *configPath, err)
+			}
+			log.Printf("created default config at %s", *configPath)
+		}
+	}
+
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)

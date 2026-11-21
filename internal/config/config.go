@@ -4,10 +4,27 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/BurntSushi/toml"
 )
+
+const DefaultConfigTOML = `listen = "127.0.0.1:8080"
+sqlite_path = "./data/llm_tracer.db"
+raw_log_dir = "./data/logs"
+dashboard_key = ""
+
+[upstreams.openai]
+url = "https://api.openai.com"
+
+[upstreams.anthropic]
+url = "https://api.anthropic.com"
+`
+
+func WriteDefault(path string) error {
+	return os.WriteFile(path, []byte(DefaultConfigTOML), 0o644)
+}
 
 type UpstreamConfig struct {
 	URL       string   `toml:"url"`
@@ -39,10 +56,10 @@ func Load(path string) (*Config, error) {
 		cfg.Listen = "127.0.0.1:8080"
 	}
 	if strings.TrimSpace(cfg.SQLitePath) == "" {
-		cfg.SQLitePath = "llm_tracer.db"
+		cfg.SQLitePath = "./data/llm_tracer.db"
 	}
 	if strings.TrimSpace(cfg.RawLogDir) == "" {
-		cfg.RawLogDir = "./raw_logs"
+		cfg.RawLogDir = "./data/logs"
 	}
 	if cfg.Upstreams == nil {
 		cfg.Upstreams = map[string]UpstreamConfig{}
