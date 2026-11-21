@@ -1,0 +1,13 @@
+listen = "127.0.0.1:13425"
+sqlite_path = "./llm_tracer.db"
+raw_log_dir = "./raw_logs"
+dashboard_key = ""
+
+[upstreams.openai]
+url = "https://api.openai.com"
+
+[upstreams.anthropic]
+url = "https://api.anthropic.com"
+
+[upstreams.local]
+url = "http://127.0.0.1:8000"

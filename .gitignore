@@ -1,0 +1,11 @@
+config.toml
+.env
+*.db
+*.db-wal
+*.db-shm
+*.log
+raw_logs/
+llm_tracer
+web/node_modules/
+web/dist/
+.DS_Store
